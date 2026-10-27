@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use vak_sandbox_env::{EnvStore, materialize};
+use vak_sandbox_env::{materialize, EnvStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRealmRequest {
@@ -104,6 +104,14 @@ impl SandboxManager {
             .write()
             .await
             .insert(updated.realm_id.clone(), updated.clone());
+        self.heartbeat.ping(Heartbeat {
+            realm_id: updated.realm_id.clone(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            pid: None,
+            load: 0.0,
+            mem_mb: 0,
+            alive: true,
+        });
         Ok(updated)
     }
 
@@ -113,6 +121,18 @@ impl SandboxManager {
 
     pub async fn list_realms(&self) -> Vec<RealmHandle> {
         self.realms.read().await.values().cloned().collect()
+    }
+
+    pub async fn destroy_realm(&self, realm_id: &str) -> Result<()> {
+        let mut realms = self.realms.write().await;
+        if let Some(mut h) = realms.remove(realm_id) {
+            h.status = RealmStatus::Destroyed;
+            // Clean up
+            let _ = tokio::fs::remove_dir_all(&h.realm_root).await;
+            Ok(())
+        } else {
+            Err(Error::Manager("Realm not found".into()))
+        }
     }
 
     pub async fn ping(&self, realm_id: &str) {

@@ -15,3 +15,4 @@ pub use backend::{
 pub use error::{Error, Result};
 pub use path::confined;
 pub use policy::{EnvPolicy, FsPolicy, NetworkPolicy, Policy, ResourcePolicy};
+pub mod journal;
