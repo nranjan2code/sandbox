@@ -33,6 +33,7 @@ zstd = "0.13"
 async-trait = "0.1"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
+anyhow = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -44,3 +45,4 @@ nursery = "warn"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
