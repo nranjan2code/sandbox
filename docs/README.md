@@ -23,3 +23,8 @@ Welcome to the vak-sandbox documentation.
 - [Contributing](../CONTRIBUTING.md) - How to contribute
 - [Changelog](../CHANGELOG.md) - Version history
 - [CI Workflow](../.github/workflows/ci.yml) - Continuous integration
+
+### Security & Operations
+- [Security Architecture](security/SECURITY_ARCHITECTURE.md) - Defense in depth, threats, controls
+- [Threat Model](security/THREAT_MODEL.md) - Detailed threat analysis
+- [Operations Runbook](operations/RUNBOOK.md) - Deployment and troubleshooting
