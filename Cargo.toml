@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/vak-sandbox-core",
     "crates/vak-sandbox-seatbelt",
+    "crates/vak-sandbox-env",
+    "crates/vak-sandbox-runtime",
+    "crates/vak-sandbox-ctl",
 ]
 
 [workspace.package]
@@ -16,11 +19,20 @@ repository = "https://github.com/nranjan2code/sandbox"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 thiserror = "2"
 sha2 = "0.10"
 tracing = "0.1"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal", "net"] }
 tempfile = "3"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tar = "0.4"
+zstd = "0.13"
+async-trait = "0.1"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
