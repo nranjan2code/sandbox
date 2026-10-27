@@ -1,0 +1,14 @@
+/Users/nisheethranjan/Projects/sandbox/target/debug/deps/thiserror-36b64d18bf6e5601.d: /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nisheethranjan/Projects/sandbox/target/debug/build/thiserror-6551b33e1a882c09/out/private.rs
+
+/Users/nisheethranjan/Projects/sandbox/target/debug/deps/libthiserror-36b64d18bf6e5601.rlib: /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nisheethranjan/Projects/sandbox/target/debug/build/thiserror-6551b33e1a882c09/out/private.rs
+
+/Users/nisheethranjan/Projects/sandbox/target/debug/deps/libthiserror-36b64d18bf6e5601.rmeta: /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /Users/nisheethranjan/Projects/sandbox/target/debug/build/thiserror-6551b33e1a882c09/out/private.rs
+
+/Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs:
+/Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs:
+/Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs:
+/Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs:
+/Users/nisheethranjan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs:
+/Users/nisheethranjan/Projects/sandbox/target/debug/build/thiserror-6551b33e1a882c09/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/nisheethranjan/Projects/sandbox/target/debug/build/thiserror-6551b33e1a882c09/out

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vak-sandbox-core",
+    "crates/vak-sandbox-seatbelt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["Nisheeth Ranjan <nisheethranjan@icloud.com>"]
+repository = "https://github.com/nranjan2code/sandbox"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+tracing = "0.1"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
