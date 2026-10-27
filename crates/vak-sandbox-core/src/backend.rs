@@ -30,16 +30,27 @@ pub trait SandboxBackend: Send + Sync {
     fn platforms(&self) -> &[&str];
     fn available(&self) -> bool;
     fn capabilities(&self) -> BackendCaps;
-    
-    fn create_process(&self, plan: &ProcessPlan) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
-    fn create_realm(&self, plan: &RealmPlan) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
+
+    fn create_process(
+        &self,
+        plan: &ProcessPlan,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
+    fn create_realm(
+        &self,
+        plan: &RealmPlan,
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
 }
 
 pub trait SandboxEnv: Send + Sync {
     fn id(&self) -> &str;
     fn mode(&self) -> SandboxMode;
-    
-    fn exec(&self, cmd: &str, args: &[String], env: &HashMap<String, String>) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>>;
+
+    fn exec(
+        &self,
+        cmd: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>>;
     fn destroy(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
@@ -62,8 +73,8 @@ pub struct ProcessPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealmPlan {
     pub id: String,
-    pub base_path: PathBuf,      // Real workspace
-    pub realm_root: PathBuf,     // Isolated copy location
+    pub base_path: PathBuf,  // Real workspace
+    pub realm_root: PathBuf, // Isolated copy location
     pub policy: Policy,
     pub snapshot_on_create: bool,
 }

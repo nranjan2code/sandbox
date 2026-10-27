@@ -16,17 +16,27 @@ impl EnvStore {
         fs::create_dir_all(root.join("state"))?;
         Ok(Self { root })
     }
-    
-    pub fn root(&self) -> &Path { &self.root }
-    pub fn artifacts_dir(&self) -> PathBuf { self.root.join("artifacts") }
-    pub fn envs_dir(&self) -> PathBuf { self.root.join("envs") }
-    pub fn realms_dir(&self) -> PathBuf { self.root.join("realms") }
-    pub fn state_dir(&self) -> PathBuf { self.root.join("state") }
-    
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.root.join("artifacts")
+    }
+    pub fn envs_dir(&self) -> PathBuf {
+        self.root.join("envs")
+    }
+    pub fn realms_dir(&self) -> PathBuf {
+        self.root.join("realms")
+    }
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
     pub fn has_env(&self, sha256: &str) -> bool {
         self.envs_dir().join(sha256).exists()
     }
-    
+
     pub fn get_env_base(&self, sha256: &str) -> Result<PathBuf> {
         let base = self.envs_dir().join(sha256);
         if !base.exists() {
@@ -34,11 +44,14 @@ impl EnvStore {
         }
         Ok(base)
     }
-    
+
     pub fn put_artifact(&self, bytes: &[u8], expected_sha: &str) -> Result<PathBuf> {
         let got = crate::hash::sha256_bytes(bytes);
         if got != expected_sha {
-            return Err(Error::HashMismatch { expected: expected_sha.to_string(), got });
+            return Err(Error::HashMismatch {
+                expected: expected_sha.to_string(),
+                got,
+            });
         }
         let path = self.artifacts_dir().join(expected_sha);
         if !path.exists() {
@@ -46,7 +59,7 @@ impl EnvStore {
         }
         Ok(path)
     }
-    
+
     pub fn default_root() -> PathBuf {
         if let Ok(home) = std::env::var("HOME") {
             PathBuf::from(home).join(".cache").join("vak-sandbox")

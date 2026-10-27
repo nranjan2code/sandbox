@@ -1,4 +1,4 @@
-use crate::{Error, Result, EnvStore};
+use crate::{EnvStore, Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,10 +13,10 @@ pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<Mat
     let base_root = store.get_env_base(sha256)?;
     let realm_root = store.realms_dir().join(realm_id);
     let writable_layer = realm_root.join(".vak-sandbox-writable");
-    
+
     fs::create_dir_all(&realm_root)?;
     fs::create_dir_all(&writable_layer)?;
-    
+
     // Try CoW on macOS (clonefile), fallback to hardlinks
     #[cfg(target_os = "macos")]
     {
@@ -28,11 +28,15 @@ pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<Mat
     {
         fallback_materialize(&base_root, &realm_root)?;
     }
-    
+
     // Make realm_root read-only except writable_layer
     harden_base(&realm_root, &writable_layer)?;
-    
-    Ok(MaterializedEnv { realm_root, base_root, writable_layer })
+
+    Ok(MaterializedEnv {
+        realm_root,
+        base_root,
+        writable_layer,
+    })
 }
 
 #[cfg(target_os = "macos")]

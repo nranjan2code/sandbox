@@ -1,13 +1,15 @@
+pub mod check;
 pub mod error;
 pub mod hash;
+pub mod prepare;
 pub mod spec;
 pub mod store;
-pub mod prepare;
-pub mod check;
+#[cfg(test)]
+mod tests;
 
+pub use check::{CheckReport, check_env};
 pub use error::{Error, Result};
-pub use hash::sha256_file;
+pub use hash::{sha256_bytes, sha256_file};
+pub use prepare::{MaterializedEnv, materialize};
 pub use spec::{EnvSpec, load_spec};
 pub use store::EnvStore;
-pub use prepare::{materialize, MaterializedEnv};
-pub use check::{check_env, CheckReport};

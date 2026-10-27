@@ -1,11 +1,11 @@
-use crate::{HeartbeatMonitor, Heartbeat};
-use vak_sandbox_env::{EnvStore, materialize};
+use crate::{Heartbeat, HeartbeatMonitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use vak_sandbox_env::{EnvStore, materialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRealmRequest {
@@ -50,19 +50,26 @@ impl SandboxManager {
             heartbeat: Arc::new(HeartbeatMonitor::new(30)),
         }
     }
-    
+
     pub async fn create_realm(&self, req: CreateRealmRequest) -> Result<RealmHandle> {
         let realm_id = Uuid::new_v4().to_string();
         let handle = RealmHandle {
             realm_id: realm_id.clone(),
             realm_root: self.store.realms_dir().join(&realm_id),
-            writable_layer: self.store.realms_dir().join(&realm_id).join(".vak-sandbox-writable"),
+            writable_layer: self
+                .store
+                .realms_dir()
+                .join(&realm_id)
+                .join(".vak-sandbox-writable"),
             status: RealmStatus::Creating,
             created_at: chrono::Utc::now(),
         };
-        
-        self.realms.write().await.insert(realm_id.clone(), handle.clone());
-        
+
+        self.realms
+            .write()
+            .await
+            .insert(realm_id.clone(), handle.clone());
+
         if let Some(sha) = req.env_sha256 {
             let mat = materialize(&self.store, &sha, &realm_id)
                 .map_err(|e| Error::Manager(e.to_string()))?;
@@ -70,7 +77,10 @@ impl SandboxManager {
             updated.realm_root = mat.realm_root;
             updated.writable_layer = mat.writable_layer;
             updated.status = RealmStatus::Ready;
-            self.realms.write().await.insert(realm_id.clone(), updated.clone());
+            self.realms
+                .write()
+                .await
+                .insert(realm_id.clone(), updated.clone());
             self.heartbeat.ping(Heartbeat {
                 realm_id: realm_id.clone(),
                 timestamp: chrono::Utc::now().timestamp() as u64,
@@ -81,25 +91,30 @@ impl SandboxManager {
             });
             return Ok(updated);
         }
-        
-        tokio::fs::create_dir_all(&handle.realm_root).await
+
+        tokio::fs::create_dir_all(&handle.realm_root)
+            .await
             .map_err(|e| Error::Manager(e.to_string()))?;
-        tokio::fs::create_dir_all(&handle.writable_layer).await
+        tokio::fs::create_dir_all(&handle.writable_layer)
+            .await
             .map_err(|e| Error::Manager(e.to_string()))?;
         let mut updated = handle;
         updated.status = RealmStatus::Ready;
-        self.realms.write().await.insert(updated.realm_id.clone(), updated.clone());
+        self.realms
+            .write()
+            .await
+            .insert(updated.realm_id.clone(), updated.clone());
         Ok(updated)
     }
-    
+
     pub async fn get_realm(&self, realm_id: &str) -> Option<RealmHandle> {
         self.realms.read().await.get(realm_id).cloned()
     }
-    
+
     pub async fn list_realms(&self) -> Vec<RealmHandle> {
         self.realms.read().await.values().cloned().collect()
     }
-    
+
     pub async fn ping(&self, realm_id: &str) {
         self.heartbeat.ping(Heartbeat {
             realm_id: realm_id.to_string(),
@@ -110,7 +125,7 @@ impl SandboxManager {
             alive: true,
         });
     }
-    
+
     pub fn heartbeat_monitor(&self) -> Arc<HeartbeatMonitor> {
         self.heartbeat.clone()
     }

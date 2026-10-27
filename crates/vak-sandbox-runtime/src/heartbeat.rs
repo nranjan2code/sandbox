@@ -32,16 +32,19 @@ impl HeartbeatMonitor {
             timeout: Duration::from_secs(timeout_secs),
         }
     }
-    
+
     pub fn ping(&self, hb: Heartbeat) {
         if let Ok(mut map) = self.heartbeats.lock() {
-            map.insert(hb.realm_id.clone(), HeartbeatEntry {
-                last: hb,
-                last_seen: Instant::now(),
-            });
+            map.insert(
+                hb.realm_id.clone(),
+                HeartbeatEntry {
+                    last: hb,
+                    last_seen: Instant::now(),
+                },
+            );
         }
     }
-    
+
     pub fn is_alive(&self, realm_id: &str) -> bool {
         if let Ok(map) = self.heartbeats.lock() {
             if let Some(entry) = map.get(realm_id) {
@@ -50,7 +53,7 @@ impl HeartbeatMonitor {
         }
         false
     }
-    
+
     pub fn get_all(&self) -> Vec<Heartbeat> {
         if let Ok(map) = self.heartbeats.lock() {
             map.values().map(|e| e.last.clone()).collect()
@@ -58,7 +61,7 @@ impl HeartbeatMonitor {
             vec![]
         }
     }
-    
+
     pub fn check_stale(&self) -> Vec<String> {
         if let Ok(map) = self.heartbeats.lock() {
             map.iter()
