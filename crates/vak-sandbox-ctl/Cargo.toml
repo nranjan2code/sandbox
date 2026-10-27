@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 vak-sandbox-core = { path = "../vak-sandbox-core" }
 vak-sandbox-runtime = { path = "../vak-sandbox-runtime" }
+vak-sandbox-seatbelt = { path = "../vak-sandbox-seatbelt" }
 vak-sandbox-env = { path = "../vak-sandbox-env" }
 clap = { workspace = true }
 serde = { workspace = true }

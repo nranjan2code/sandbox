@@ -15,6 +15,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run a command in the sandbox (OS-level process containment)
+    Run {
+        /// Command to execute
+        #[arg(help = "Command to run")]
+        command: String,
+        /// Command arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Environment management
     Env {
         #[command(subcommand)]
@@ -101,6 +110,40 @@ async fn main() -> anyhow::Result<()> {
     let mgr = Arc::new(SandboxManager::new(store));
 
     match cli.command {
+        Commands::Run { command, args } => {
+            println!("Running in sandbox: {} {}", command, args.join(" "));
+            println!("(vaksb run implementation - OS-level process isolation via backend)");
+            // Backend selection
+            #[cfg(target_os = "macos")]
+            {
+                use vak_sandbox_core::{ProcessPlan, Policy, SandboxBackend};
+                use vak_sandbox_seatbelt::SeatbeltBackend;
+                use std::collections::HashMap;
+                let backend = SeatbeltBackend;
+                if !backend.available() {
+                    println!("Seatbelt backend not available");
+                    return Ok(());
+                }
+                let policy = Policy::deny_all()
+                    .allow_path_read("/usr".into())
+                    .allow_path_read("/bin".into())
+                    .allow_path_read("/etc".into())
+                    .allow_path_write("/tmp".into());
+                let plan = ProcessPlan {
+                    command: command.clone(),
+                    args,
+                    cwd: Some("/tmp".into()),
+                    env: HashMap::new(),
+                    policy,
+                };
+                let env = backend.create_process(&plan).await?;
+                println!("Sandboxed process started: {:?}", env.id());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                println!("OS-level sandbox backend not available on this platform");
+            }
+        }
         Commands::Env { action } => match action {
             EnvAction::List => {
                 println!("Environments stored in: {:?}", EnvStore::default_root().join("envs"));

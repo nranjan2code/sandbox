@@ -941,6 +941,7 @@ dependencies = [
  "vak-sandbox-core",
  "vak-sandbox-env",
  "vak-sandbox-runtime",
+ "vak-sandbox-seatbelt",
 ]
 
 [[package]]
