@@ -195,6 +195,7 @@ mod macos {
     struct SeatbeltEnv {
         id: String,
         mode: SandboxMode,
+        #[allow(dead_code)]
         child: Mutex<tokio::process::Child>,
     }
 
@@ -215,7 +216,7 @@ mod macos {
                 };
                 
                 tokio::spawn(async move {
-                    let mut child = Command::new("sh")
+                    let child = Command::new("sh")
                         .arg("-c")
                         .arg(&full_cmd)
                         .stdout(Stdio::piped())

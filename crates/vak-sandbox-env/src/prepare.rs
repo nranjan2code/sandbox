@@ -40,10 +40,12 @@ pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<Mat
 
 #[cfg(target_os = "macos")]
 fn clonefile_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
-    // Copy contents of src into dst using clonefile where possible
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("cp -cR \"{}\"/. \"{}\"/", src.display(), dst.display()))
+    // Copy contents of src into dst using clonefile where possible.
+    // Use cp -c with explicit args to avoid shell interpolation of paths.
+    let status = std::process::Command::new("cp")
+        .arg("-cR")
+        .arg(format!("{}/.", src.display()))
+        .arg(dst)
         .status()?;
     if !status.success() {
         return Err(Error::Materialize("clonefile/cp -c failed".to_string()));
@@ -52,9 +54,10 @@ fn clonefile_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn fallback_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("cp -R \"{}\"/. \"{}\"/", src.display(), dst.display()))
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(format!("{}/.", src.display()))
+        .arg(dst)
         .status()?;
     if !status.success() {
         return Err(Error::Materialize("copy failed".to_string()));

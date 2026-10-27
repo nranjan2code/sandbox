@@ -1,4 +1,4 @@
-use crate::{EnvSpec, Error, Result};
+use crate::{EnvSpec, Result};
 use std::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

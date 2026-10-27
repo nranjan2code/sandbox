@@ -76,3 +76,58 @@ pub enum Error {
     Json(serde_json::Error),
 }
 ```
+
+### Journal (Promotion)
+
+```rust
+pub struct PromotionJournal { ... }
+pub struct JournalEntry { id, timestamp, operation, status, workspace_root }
+pub enum JournalOp { Begin, Backup, Change, Apply, Rollback, Commit, Abort }
+pub enum ChangeAction { Create, Modify, Delete }
+pub enum JournalStatus { Pending, Applied, Committed, RolledBack, Failed }
+
+// Methods
+PromotionJournal::new(journal_dir) -> Result<Self>
+.begin(realm_id, base_path) -> Result<String>
+.backup(file, backup_path) -> Result<()>
+.change(file, action) -> Result<()>
+.commit() -> Result<()>
+.abort() -> Result<()>
+.load_journal(id) -> Result<Vec<JournalEntry>>
+.list_incomplete() -> Result<Vec<String>>
+```
+
+### Runtime
+
+```rust
+pub struct SandboxManager { ... }
+pub struct CreateRealmRequest { env_sha256, env_id, base_path, policy_overrides }
+pub struct RealmHandle { realm_id, realm_root, writable_layer, status, created_at }
+pub enum RealmStatus { Creating, Ready, Running, Stopped, Promoted, Destroyed, Error }
+
+// Methods
+SandboxManager::new(store) -> Self
+.create_realm(req) -> Result<RealmHandle>
+.get_realm(id) -> Option<RealmHandle>
+.list_realms() -> Vec<RealmHandle>
+.destroy_realm(id) -> Result<()>
+.ping(id)
+.heartbeat_monitor() -> Arc<HeartbeatMonitor>
+
+pub struct Promoter { ... }
+pub struct PromotionPlan { realm_root, base_path, changes }
+pub struct PromotionReceipt { journal_id, promoted_files, backed_up }
+
+Promoter::new(state_dir) -> Result<Self>
+.promote(plan) -> Result<PromotionReceipt>
+.rollback(journal_id) -> Result<()>
+
+pub struct HeartbeatMonitor { ... }
+.heartbeat.ping(hb)
+.is_alive(realm_id) -> bool
+.get_all() -> Vec<Heartbeat>
+.check_stale() -> Vec<String>
+
+pub enum ControlMessage { Ping, Exec, Snapshot, Promote, Destroy, Status }
+pub enum ControlResponse { Pong, ExecResult, Snapshot, Promoted, Destroyed, Status, Error }
+```
