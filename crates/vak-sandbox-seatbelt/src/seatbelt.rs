@@ -93,11 +93,15 @@ mod macos {
                     }
                 }
                 if self.policy.network.allow_outbound {
+                if self.policy.network.allow_hosts.is_empty() {
+                    p.push_str("(allow network-outbound)\n");
+                } else {
                     for host in &self.policy.network.allow_hosts {
                         if host.contains(':') || host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                            p.push_str(&format!("(allow network-outbound (remote ip \"{}:*\"))\n", host));
+                            p.push_str(&format!("(allow network-outbound (remote ip \"{}:*\")\n", host));
                         }
                     }
+                }
                 }
             }
             p
@@ -157,6 +161,7 @@ mod macos {
                 Ok(Box::new(SeatbeltEnv {
                     id: uuid::Uuid::new_v4().to_string(),
                     mode: SandboxMode::Process,
+                    policy: plan.policy.clone(),
                     child: Mutex::new(child),
                 }) as Box<dyn SandboxEnv>)
             })
@@ -186,6 +191,7 @@ mod macos {
                 Ok(Box::new(SeatbeltEnv {
                     id: plan.id,
                     mode: SandboxMode::Realm,
+                    policy: plan.policy.clone(),
                     child: Mutex::new(child),
                 }) as Box<dyn SandboxEnv>)
             })
@@ -195,6 +201,7 @@ mod macos {
     struct SeatbeltEnv {
         id: String,
         mode: SandboxMode,
+        policy: Policy,
         #[allow(dead_code)]
         child: Mutex<tokio::process::Child>,
     }
@@ -206,23 +213,35 @@ mod macos {
         fn exec(&self, cmd: &str, args: &[String], _env: &HashMap<String, String>) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>> {
             let cmd = cmd.to_string();
             let args: Vec<String> = args.to_vec();
+            let policy = self.policy.clone();
             Box::pin(async move {
                 let (tx_out, rx_out) = mpsc::channel(256);
                 let (tx_err, rx_err) = mpsc::channel(256);
                 let (tx_exit, rx_exit) = oneshot::channel();
-                
+
+                let profile = SeatbeltProfile {
+                    _workspace: std::path::PathBuf::from("/tmp"),
+                    mode: SandboxMode::Process,
+                    policy: policy.clone(),
+                };
+                let profile_str = profile.generate();
+
                 let full_cmd = if args.is_empty() { cmd.clone() } else {
                     format!("{} {}", shell_quote(&cmd), args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "))
                 };
-                
+
                 tokio::spawn(async move {
-                    let child = Command::new("sh")
+                    let child = Command::new("sandbox-exec")
+                        .arg("-p")
+                        .arg(&profile_str)
+                        .arg("--")
+                        .arg("sh")
                         .arg("-c")
                         .arg(&full_cmd)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn();
-                    
+
                     match child {
                         Ok(mut c) => {
                             if let Some(stdout) = c.stdout.take() {
@@ -253,7 +272,7 @@ mod macos {
                         }
                     }
                 });
-                
+
                 Ok(ExecHandle {
                     stdout: rx_out,
                     stderr: rx_err,

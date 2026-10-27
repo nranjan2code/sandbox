@@ -111,9 +111,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Run { command, args } => {
-            println!("Running in sandbox: {} {}", command, args.join(" "));
-            println!("(vaksb run implementation - OS-level process isolation via backend)");
-            // Backend selection
+            // Run command under OS-level sandbox, forwarding I/O
             #[cfg(target_os = "macos")]
             {
                 use vak_sandbox_core::{ProcessPlan, Policy, SandboxBackend};
@@ -121,27 +119,50 @@ async fn main() -> anyhow::Result<()> {
                 use std::collections::HashMap;
                 let backend = SeatbeltBackend;
                 if !backend.available() {
-                    println!("Seatbelt backend not available");
-                    return Ok(());
+                    eprintln!("Seatbelt backend not available");
+                    std::process::exit(1);
                 }
                 let policy = Policy::deny_all()
                     .allow_path_read("/usr".into())
                     .allow_path_read("/bin".into())
                     .allow_path_read("/etc".into())
-                    .allow_path_write("/tmp".into());
+                    .allow_path_read("/System".into())
+                    .allow_path_read("/Library".into())
+                    .allow_path_write("/tmp".into())
+                    .allow_path_write("/dev".into());
                 let plan = ProcessPlan {
                     command: command.clone(),
-                    args,
+                    args: args.clone(),
                     cwd: Some("/tmp".into()),
                     env: HashMap::new(),
                     policy,
                 };
-                let env = backend.create_process(&plan).await?;
-                println!("Sandboxed process started: {:?}", env.id());
+                let env = backend.create_process(&plan).await
+                    .unwrap_or_else(|e| { eprintln!("Failed to create sandbox: {}", e); std::process::exit(1); });
+                let mut handle = env.exec(&command, &args, &HashMap::new()).await
+                    .unwrap_or_else(|e| { eprintln!("Failed to exec: {}", e); std::process::exit(1); });
+                // Forward stdout
+                let stdout_task = tokio::spawn(async move {
+                    while let Some(line) = handle.stdout.recv().await {
+                        println!("{}", line);
+                    }
+                    handle.exit_code.await.unwrap_or(-1)
+                });
+                // Forward stderr
+                let stderr_task = tokio::spawn(async move {
+                    while let Some(line) = handle.stderr.recv().await {
+                        eprintln!("{}", line);
+                    }
+                });
+                let code = stdout_task.await.unwrap_or(-1);
+                let _ = stderr_task.await;
+                env.destroy().await.ok();
+                std::process::exit(code);
             }
             #[cfg(not(target_os = "macos"))]
             {
-                println!("OS-level sandbox backend not available on this platform");
+                eprintln!("OS-level sandbox backend not available on this platform");
+                std::process::exit(1);
             }
         }
         Commands::Env { action } => match action {
