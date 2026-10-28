@@ -4,6 +4,8 @@
 
 vak-sandbox is built around these core principles:
 
+Current implementation includes macOS process containment and durable retained Realms with bounded execution, paged review, fingerprint-bound promotion, backups, conflict checks, explicit recovery, latest-promotion rollback and destruction. The durable owner is `RealmStore`; OS containment uses the process backend. Snapshots are review manifests, not restorable checkpoints. Linux and stronger resource quotas remain unsupported. This document also contains target architecture; the [runbook](../operations/RUNBOOK.md) and [README](../../README.md#current-implementation-status) define the supported path.
+
 ### 1. Separation of Concerns
 - **ProcessSandbox**: OS-level process containment only
 - **RealmSandbox**: Workspace isolation + reviewable promotion (separate from process jailing)

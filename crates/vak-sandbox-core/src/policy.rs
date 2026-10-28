@@ -157,7 +157,6 @@ impl Policy {
     }
 
     pub fn allow_path_write(mut self, path: PathBuf) -> Self {
-        self.fs.allow_read.push(path.clone());
         self.fs.allow_write.push(path);
         self
     }

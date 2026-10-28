@@ -32,9 +32,19 @@
 `vak-sandbox` provides two complementary isolation strategies in one cohesive system:
 
 1. **Process containment** - OS-level capability restriction (macOS Seatbelt, Linux Landlock/seccomp/bubblewrap) to jail individual processes with deny-by-default policies
-2. **Realm isolation with reviewable promotion** - Create isolated, disposable workspace copies for agents to work in freely (install deps, run builds/tests, make arbitrary changes), inspect diffs, then promote reviewed changes atomically with crash-safe journaling and rollback
+2. **Durable Realms with reviewed promotion** - Retain an isolated project copy across commands, review exact changes, apply a fingerprint-bound candidate and recover or roll back through durable receipts
 
 Built for Vakyartha's agent execution needs, `vak-sandbox` is backend-agnostic, observable, and designed to be safe by construction.
+
+## Current implementation status
+
+The macOS `vaksb run` process jail is implemented and used by Vakyartha for approved commands in a disposable, size-limited project snapshot. It supports a confined workspace and working directory, optional wall-time and output limits, and a deny-network Seatbelt profile. The tool currently enforces wall time, output and snapshot bounds; memory and CPU quotas are not enforced.
+
+`SandboxManager` now uses a durable `RealmStore`. Independent CLI invocations share saved work through `--store`. Create, list/status, bounded exec, paged review snapshots, file reads, promotion, latest-promotion rollback, interrupted-work recovery and destruction are implemented. Vakyartha exposes them through its existing integration tools and Settings. Mutation tools ask by default.
+
+Promotion stages immutable candidates and backups before writing, checks reviewed fingerprints/path lists and original versions, journals progress, and uses atomic individual-file replacement. Multi-file promotion is recoverable, not globally atomic to external readers. Locks coordinate operations in the canonical store; external editors do not honor them, so avoid concurrent target edits. Recovery never replays a command. A snapshot is a review manifest, not a restorable filesystem checkpoint.
+
+Bounds: 30 seconds/32 KiB per Realm command; 512 MiB/50,000 entries/8 MiB manifest per copy; 32 retained Realms; 200 changed paths per promotion; 20 changes or 16 KiB file text per read page. Regular files/directories only; symlinks, special files and file/directory replacement are refused. Common credential paths are excluded by filename, not content inspection. CPU, memory, process-count and disk-growth quotas are not enforced. Linux backends remain stubs.
 
 ## Philosophy
 
@@ -57,7 +67,7 @@ Built for Vakyartha's agent execution needs, `vak-sandbox` is backend-agnostic, 
 - **Heartbeat & liveness monitoring** - Track realm health with configurable timeouts, stale detection, and ping protocol
 - **Control protocol** - Structured message-based protocol for coordination (`Ping`, `Exec`, `Snapshot`, `Promote`, `Destroy`, `Status`)
 - **Environment checking** - Validate environments with required binaries and post-checks
-- **Crash-safe promotion** (in progress) - Write-ahead journals, backups, atomic operations, rollback
+- **Recoverable promotion** - Durable candidates/backups, write-ahead transaction state, per-file atomic replacement, explicit recovery and rollback
 - **Cross-platform** - macOS (Seatbelt) production-ready foundation, Linux (Landlock + seccomp-bpf + bubblewrap) stubs in place
 
 ## Architecture
@@ -90,10 +100,10 @@ Built for Vakyartha's agent execution needs, `vak-sandbox` is backend-agnostic, 
 | Crate | Purpose | Status |
 | --- | --- | --- |
 | `vak-sandbox-core` | Runtime-agnostic traits, policies, path confinement, errors | Core complete |
-| `vak-sandbox-seatbelt` | macOS Seatbelt backend with safe profile generation | Process jail implemented, realm support in progress |
+| `vak-sandbox-seatbelt` | macOS Seatbelt backend with safe profile generation | Process containment for disposable and retained workspaces; durable lifecycle belongs to the runtime |
 | `vak-sandbox-env` | Environment store, specs, hashing, CoW materialization, validation | Complete with tests |
 | `vak-sandbox-runtime` | Sandbox manager, heartbeat monitor, control protocol, orchestration | Complete with tests |
-| `vak-sandbox-ctl` | CLI (`vaksb`) for management and operations | Skeleton, expanding |
+| `vak-sandbox-ctl` | CLI (`vaksb`) | `run`, durable Realm lifecycle, reviewed promotion, recovery and rollback implemented |
 
 ## Modes
 
@@ -125,9 +135,9 @@ let backend = SeatbeltBackend;
 let env = backend.create_process(&plan).await?;
 ```
 
-### RealmSandbox (Isolated workspace with reviewable promotion)
+### Durable Realm workspaces
 
-Create an isolated copy of a workspace where agents can work freely. All changes stay in the realm until explicitly promoted with review.
+The runtime stores each project copy separately from its control state. Use `--store` consistently between CLI invocations; Vakyartha sets it to its private data directory. Commands run inside the copy through the Seatbelt process jail. Only explicit reviewed promotion can write the original. See the [operations runbook](docs/operations/RUNBOOK.md) for the exact CLI and recovery flow.
 
 ```rust
 use vak_sandbox_runtime::{SandboxManager, CreateRealmRequest};
@@ -190,25 +200,20 @@ confined(&root, "/etc/passwd")?;  // Err(PathEscape)
 - Artifacts verified by SHA256 before materialization
 - Environments stored content-addressed in `~/.cache/vak-sandbox/`
 
-### Resource Limits
+### Resource limits
 
-Default resource limits (configurable):
-- CPU: 3600s
-- Memory: 2GB
-- Wall time: 7200s
-- Processes: 256
-- File size: 1GB
+`ResourcePolicy` declares default values, but the current macOS backend does not enforce memory, CPU, process-count or per-file-size quotas. `vaksb run` enforces only explicitly supplied wall-time and output caps. Vakyartha also bounds its snapshot size and file count before launch.
 
 ## Platform Support
 
 | Feature | macOS (Seatbelt) | Linux (Landlock/seccomp/bwrap) |
 | --- | --- | --- |
 | Process jail | ✅ Implemented | 🚧 Stubs in place |
-| Realm isolation | 🚧 In progress | 🚧 Planned |
+| Durable Realm workflow | ✅ macOS process jail + retained copy + reviewed promotion | 🚧 Planned |
 | Network control | ✅ Fine-grained | 🚧 Planned |
 | Path confinement | ✅ App-level | ✅ App-level |
 | CoW materialization | ✅ `cp -c` / clonefile | 🚧 reflinks/hardlinks |
-| Resource limits | ⚠️ Limited by OS | 🚧 rlimits/cgroups |
+| Resource limits | ⚠️ CLI wall/output caps only; no memory/CPU quotas | 🚧 rlimits/cgroups |
 | Status | **Usable for process jail** | **Development** |
 
 ## Installation
@@ -394,21 +399,29 @@ ControlResponse::Error { message }
 # Show help
 vaksb --help
 
-# Environment management (planned)
+# Process containment (implemented on macOS)
+vaksb run --workspace /tmp/job --cwd /tmp/job --timeout-seconds 30 --max-output-bytes 32768 -- python3 -c 'print("hello")'
+
+# Environment management
 vaksb env list
 vaksb env check <spec.toml>
-vaksb env materialize <sha256> <realm-id>
 
-# Realm operations (planned)
-vaksb realm create [--env <sha256>]
-vaksb realm list
-vaksb realm exec <realm-id> -- <cmd> [args...]
-vaksb realm snapshot <realm-id>
-vaksb realm promote <realm-id>
-vaksb realm destroy <realm-id>
+# Durable Realms (reuse the same --store for every invocation)
+vaksb --store /private/control realm create --project /path/to/project
+vaksb --store /private/control realm list
+vaksb --store /private/control realm status <realm-id>
+vaksb --store /private/control realm exec <realm-id> --cwd . -- /bin/pwd
+vaksb --store /private/control realm snapshot <realm-id> --offset 0
+vaksb --store /private/control realm read <realm-id> file.txt --offset 0
+# Use the exact fingerprint and all paths returned by the review, in order:
+vaksb --store /private/control realm promote <realm-id> --fingerprint <sha256> --paths=file.txt
+vaksb --store /private/control realm rollback <realm-id> <transaction-id> --paths=file.txt
+# Use the exact recovery_paths from status (omit --paths when empty):
+vaksb --store /private/control realm recover <realm-id> --paths=file.txt
+vaksb --store /private/control realm destroy <realm-id>
 
-# Status & monitoring (planned)
-vaksb status [realm-id]
+# Saved status is durable; heartbeat pings are process-local observations.
+vaksb --store /private/control status [realm-id]
 vaksb ping <realm-id>
 vaksb health
 ```
@@ -509,13 +522,13 @@ docker build -t vaksb-test:alpine -f Dockerfile.test .
 - [x] Linux stubs (Landlock/Bubblewrap)
 - [x] Basic tests on macOS and Linux
 
-### Phase 2: Realm & Promotion (In Progress)
-- [ ] Complete Seatbelt realm creation with full isolation
-- [ ] Promotion journal (write-ahead log)
-- [ ] Crash-safe promotion with backups
-- [ ] Rollback/undo mechanism
-- [ ] Diff generation and review workflow
-- [ ] File locking for concurrent promotion safety
+### Phase 2: Bounded durable Realm workflow (Implemented)
+- [x] Runtime-owned retained copies with macOS process containment
+- [x] Durable promotion transaction journal
+- [x] Recoverable promotion with durable candidates/backups
+- [x] Latest-promotion rollback with conflict refusal
+- [x] Paged change manifest and original/candidate file review
+- [x] OS file locks for operations sharing the canonical control store
 
 ### Phase 3: Linux Backends (Planned)
 - [ ] Landlock LSM integration
@@ -524,10 +537,11 @@ docker build -t vaksb-test:alpine -f Dockerfile.test .
 - [ ] Resource limits via rlimits/cgroups
 - [ ] Cross-platform backend auto-detection
 
-### Phase 4: CLI & Management (Planned)
-- [ ] Full `vaksb` CLI implementation
+### Phase 4: CLI & Management (In Progress)
+- [x] One-shot macOS `vaksb run` process containment with optional cwd, workspace, wall-time and output bounds
+- [x] Environment spec checking and basic health/status command surface
 - [ ] Environment download/fetch integration points
-- [ ] Realm exec/snapshot/promote/destroy commands
+- [ ] Durable realm create/exec/snapshot/promote/destroy commands
 - [ ] Status dashboard and health monitoring
 - [ ] JSON output mode for programmatic use
 - [ ] Configuration file support

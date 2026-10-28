@@ -1,5 +1,7 @@
 # Core API Documentation
 
+Durable Realm and promotion state is owned by `vak_sandbox_runtime::realm::RealmStore`; execution uses the macOS Seatbelt process jail; see the [implementation status](../../README.md#current-implementation-status).
+
 ## vak-sandbox-core
 
 ### Traits
@@ -114,13 +116,28 @@ SandboxManager::new(store) -> Self
 .ping(id)
 .heartbeat_monitor() -> Arc<HeartbeatMonitor>
 
-pub struct Promoter { ... }
-pub struct PromotionPlan { realm_root, base_path, changes }
-pub struct PromotionReceipt { journal_id, promoted_files, backed_up }
+// manager.realms() opens the same durable store used by the CLI.
+pub struct RealmStore { /* private control root */ }
+pub struct RealmLease { pub record: RealmRecord, /* OS lock */ }
+pub struct RealmRecord { realm_id, workspace, base_path, created_at, status, baseline, last_transaction }
+pub struct Review { realm_id, fingerprint, changes, can_promote }
+pub struct Receipt { transaction_id, realm_id, phase, paths }
+RealmStore::open(root) -> io::Result<Self>
+.create(project: Option<&Path>) -> io::Result<RealmRecord>
+.list() -> io::Result<Vec<RealmRecord>>
+.lease(realm_id) -> io::Result<RealmLease>
+.review(record) -> io::Result<Review>
+.snapshot(record) -> io::Result<Review>
+.read_file(record, relative_path, byte_offset, original) -> io::Result<Value>
+.promote(lease, fingerprint, paths) -> io::Result<Receipt>
+.rollback(lease, transaction_id, paths) -> io::Result<Receipt>
+.recover(lease, recovery_paths) -> io::Result<Vec<Receipt>>
+.destroy(lease) -> io::Result<()>
+.ensure_ready(record) -> io::Result<()>
 
-Promoter::new(state_dir) -> Result<Self>
-.promote(plan) -> Result<PromotionReceipt>
-.rollback(journal_id) -> Result<()>
+// Locks, manifests, candidates, backups and transaction state stay outside
+// record.workspace. Legacy path-copy Promoter is removed: it lacked the
+// reviewed fingerprint, source conflicts, creation rollback and durable recovery.
 
 pub struct HeartbeatMonitor { ... }
 .heartbeat.ping(hb)

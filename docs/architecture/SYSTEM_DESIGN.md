@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-vak-sandbox is a defense-in-depth execution isolation system that provides two orthogonal capabilities: OS-level process containment and transactional workspace isolation with reviewable promotion. The design prioritizes security, correctness, and recoverability over convenience.
+Current implementation includes macOS process containment and durable retained Realms with bounded execution, paged review, fingerprint-bound promotion, backups, conflict checks, explicit recovery, latest-promotion rollback and destruction. The durable owner is `RealmStore`; OS containment uses the process backend. Snapshots are review manifests, not restorable checkpoints. Linux and stronger resource quotas remain unsupported. This document also contains target architecture; the [runbook](../operations/RUNBOOK.md) and [README](../../README.md#current-implementation-status) define the supported path.
 
 ## Problem Statement
 

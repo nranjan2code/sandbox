@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vak_sandbox_env::EnvStore;
@@ -11,12 +12,27 @@ use vak_sandbox_runtime::{CreateRealmRequest, SandboxManager};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Private durable control store, outside every Realm workspace
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Run a command in the sandbox (OS-level process containment)
     Run {
+        /// Directory in the isolated workspace where the command starts
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// The only workspace directory the command may read or write
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Stop the process after this many seconds (1–300)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: Option<u64>,
+        /// Maximum combined stdout and stderr bytes (1 KiB–256 KiB)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1024..=262144))]
+        max_output_bytes: Option<u64>,
         /// Command to execute
         #[arg(help = "Command to run")]
         command: String,
@@ -61,38 +77,61 @@ enum EnvAction {
 
 #[derive(Subcommand)]
 enum RealmAction {
-    /// Create a new realm
+    /// Copy one project into a durable isolated workspace
     Create {
-        #[arg(long, help = "Environment SHA256")]
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
         env: Option<String>,
     },
-    /// List all realms
     List,
-    /// Get realm status
     Status {
-        #[arg(help = "Realm ID")]
         realm_id: String,
     },
-    /// Execute command in realm
+    /// Execute a bounded command in an existing workspace
     Exec {
-        #[arg(help = "Realm ID")]
         realm_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Create snapshot
+    /// Review the current candidate and record a fingerprint
     Snapshot {
-        #[arg(help = "Realm ID")]
         realm_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
-    /// Promote realm changes
+    /// Read a bounded page of a candidate file
+    Read {
+        realm_id: String,
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long)]
+        original: bool,
+    },
+    /// Apply exactly the reviewed paths after external approval
     Promote {
-        #[arg(help = "Realm ID")]
         realm_id: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long, num_args = 1..)]
+        paths: Vec<String>,
     },
-    /// Destroy realm
+    Rollback {
+        realm_id: String,
+        transaction_id: String,
+        #[arg(long, num_args = 1..)]
+        paths: Vec<String>,
+    },
+    /// Recover interrupted execution/promotion without replaying a command
+    Recover {
+        realm_id: String,
+        #[arg(long, num_args = 1..)]
+        paths: Vec<String>,
+    },
     Destroy {
-        #[arg(help = "Realm ID")]
         realm_id: String,
     },
 }
@@ -100,62 +139,199 @@ enum RealmAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let cli = Cli::parse();
-    let store = Arc::new(EnvStore::new(EnvStore::default_root())?);
+    let store = Arc::new(EnvStore::new(
+        cli.store.unwrap_or_else(EnvStore::default_root),
+    )?);
     let mgr = Arc::new(SandboxManager::new(store));
 
     match cli.command {
-        Commands::Run { command, args } => {
+        Commands::Run {
+            cwd,
+            workspace,
+            timeout_seconds,
+            max_output_bytes,
+            command,
+            args,
+        } => {
             // Run command under OS-level sandbox, forwarding I/O
             #[cfg(target_os = "macos")]
             {
-                use vak_sandbox_core::{ProcessPlan, Policy, SandboxBackend};
-                use vak_sandbox_seatbelt::SeatbeltBackend;
                 use std::collections::HashMap;
+                use vak_sandbox_core::{Policy, ProcessPlan, SandboxBackend};
+                use vak_sandbox_seatbelt::SeatbeltBackend;
                 let backend = SeatbeltBackend;
                 if !backend.available() {
                     eprintln!("Seatbelt backend not available");
                     std::process::exit(1);
                 }
-                let policy = Policy::deny_all()
+                let inherited = std::env::var("VAK_SANDBOX").as_deref() == Ok("1");
+                let default_workspace = if inherited {
+                    std::env::current_dir()?
+                } else {
+                    PathBuf::from("/tmp")
+                };
+                let workspace = workspace.unwrap_or(default_workspace);
+                let workspace = std::fs::canonicalize(&workspace)?;
+                if [
+                    "/", "/Users", "/home", "/System", "/Library", "/private", "/var",
+                ]
+                .iter()
+                .any(|root| workspace == PathBuf::from(root))
+                {
+                    anyhow::bail!(
+                        "workspace must be a specific project directory, not a filesystem root"
+                    );
+                }
+                let cwd = cwd.unwrap_or_else(|| workspace.clone());
+                let cwd = std::fs::canonicalize(&cwd)?;
+                if !cwd.starts_with(&workspace) {
+                    anyhow::bail!("working directory must be inside the sandbox workspace");
+                }
+                let mut policy = Policy::deny_all()
                     .allow_path_read("/usr".into())
                     .allow_path_read("/bin".into())
                     .allow_path_read("/etc".into())
                     .allow_path_read("/System".into())
                     .allow_path_read("/Library".into())
-                    .allow_path_write("/tmp".into())
+                    .allow_path_read("/opt".into())
+                    .allow_path_read("/usr/local".into())
+                    .allow_path_read(workspace.clone())
+                    .allow_path_write(workspace.clone())
                     .allow_path_write("/dev".into());
+                let path = if inherited {
+                    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
+                } else {
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into()
+                };
+                policy.env.set.insert("PATH".into(), path);
+                policy
+                    .env
+                    .set
+                    .insert("HOME".into(), workspace.display().to_string());
+                policy
+                    .env
+                    .set
+                    .insert("TMPDIR".into(), workspace.display().to_string());
+                let mut command_env = HashMap::new();
+                if inherited {
+                    for (key, value) in std::env::vars() {
+                        if key == "VAK_SANDBOX" {
+                            continue;
+                        }
+                        policy = policy.allow_env(key.clone());
+                        command_env.insert(key, value);
+                    }
+                }
+                if let Ok(executable) = std::fs::canonicalize(&command) {
+                    policy = policy.allow_path_read(executable);
+                }
+                if let Some(script) = args.first().and_then(|arg| std::fs::canonicalize(arg).ok()) {
+                    policy = policy.allow_path_read(script.clone());
+                    for ancestor in script.ancestors() {
+                        if ancestor
+                            .file_name()
+                            .is_some_and(|name| name == "node_modules")
+                        {
+                            if let Some(package_root) = ancestor.parent() {
+                                policy = policy.allow_path_read(package_root.to_path_buf());
+                            }
+                            break;
+                        }
+                    }
+                }
                 let plan = ProcessPlan {
                     command: command.clone(),
                     args: args.clone(),
-                    cwd: Some("/tmp".into()),
-                    env: HashMap::new(),
+                    cwd: Some(cwd),
+                    env: command_env,
                     policy,
                 };
-                let env = backend.create_process(&plan).await
-                    .unwrap_or_else(|e| { eprintln!("Failed to create sandbox: {}", e); std::process::exit(1); });
-                let mut handle = env.exec(&command, &args, &HashMap::new()).await
-                    .unwrap_or_else(|e| { eprintln!("Failed to exec: {}", e); std::process::exit(1); });
-                // Forward stdout
-                let stdout_task = tokio::spawn(async move {
-                    while let Some(line) = handle.stdout.recv().await {
-                        println!("{}", line);
-                    }
-                    handle.exit_code.await.unwrap_or(-1)
+                let env = backend.create_process(&plan).await.unwrap_or_else(|e| {
+                    eprintln!("Failed to create sandbox: {}", e);
+                    std::process::exit(1);
                 });
-                // Forward stderr
-                let stderr_task = tokio::spawn(async move {
-                    while let Some(line) = handle.stderr.recv().await {
-                        eprintln!("{}", line);
+                let handle = env
+                    .exec(&command, &args, &HashMap::new())
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to exec: {}", e);
+                        std::process::exit(1);
+                    });
+                let deadline = async {
+                    if let Some(seconds) = timeout_seconds {
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
-                });
-                let code = stdout_task.await.unwrap_or(-1);
-                let _ = stderr_task.await;
+                };
+                tokio::pin!(deadline);
+                let mut stdout = handle.stdout;
+                let mut stderr = handle.stderr;
+                let exit = handle.exit_code;
+                let mut exit_task = tokio::spawn(async move { exit.await.unwrap_or(-1) });
+                let mut output_bytes = 0usize;
+                let mut code = -1;
+                let mut stdout_done = false;
+                let mut stderr_done = false;
+                let mut timed_out = false;
+                let mut interrupted = false;
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                let mut int =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+                while !(stdout_done && stderr_done) {
+                    tokio::select! {
+                        _ = &mut deadline => { timed_out = true; break; }
+                        _ = term.recv() => { interrupted = true; break; }
+                        _ = int.recv() => { interrupted = true; break; }
+                        line = stdout.recv(), if !stdout_done => match line {
+                            Some(line) => {
+                                output_bytes = output_bytes.saturating_add(line.len() + 1);
+                                if max_output_bytes.is_some_and(|max| output_bytes as u64 > max) { break; }
+                                print!("{line}");
+                            }
+                            None => stdout_done = true,
+                        },
+                        line = stderr.recv(), if !stderr_done => match line {
+                            Some(line) => {
+                                output_bytes = output_bytes.saturating_add(line.len() + 1);
+                                if max_output_bytes.is_some_and(|max| output_bytes as u64 > max) { break; }
+                                eprint!("{line}");
+                            }
+                            None => stderr_done = true,
+                        },
+                        result = &mut exit_task, if stdout_done && stderr_done => {
+                            code = result.unwrap_or(-1);
+                            break;
+                        }
+                    }
+                }
+                if interrupted {
+                    env.destroy().await.ok();
+                    std::process::exit(143);
+                }
+                if timed_out || max_output_bytes.is_some_and(|max| output_bytes as u64 > max) {
+                    eprintln!(
+                        "{}",
+                        if timed_out {
+                            "sandbox execution timed out"
+                        } else {
+                            "sandbox output limit exceeded"
+                        }
+                    );
+                    env.destroy().await.ok();
+                    std::process::exit(if timed_out { 124 } else { 125 });
+                }
+                if code == -1 {
+                    code = exit_task.await.unwrap_or(-1);
+                }
                 env.destroy().await.ok();
                 std::process::exit(code);
             }
@@ -167,7 +343,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Env { action } => match action {
             EnvAction::List => {
-                println!("Environments stored in: {:?}", EnvStore::default_root().join("envs"));
+                println!(
+                    "Environments stored in: {:?}",
+                    EnvStore::default_root().join("envs")
+                );
                 println!("(Use env specs to define environments)");
             }
             EnvAction::Check { spec } => {
@@ -177,58 +356,113 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Description: {}", s.env.description);
             }
         },
-        Commands::Realm { action } => match action {
-            RealmAction::Create { env } => {
-                let realm = mgr.create_realm(CreateRealmRequest {
-                    env_sha256: env,
-                    env_id: None,
-                    base_path: None,
-                    policy_overrides: None,
-                }).await?;
-                println!("✓ Created realm");
-                println!("  ID: {}", realm.realm_id);
-                println!("  Root: {}", realm.realm_root.display());
-                println!("  Status: {:?}", realm.status);
-            }
-            RealmAction::List => {
-                let realms = mgr.list_realms().await;
-                if realms.is_empty() {
-                    println!("No realms found");
-                } else {
-                    println!("Realms ({}):", realms.len());
-                    for r in realms {
-                        println!("  {} - {:?} - {}", r.realm_id, r.status, r.realm_root.display());
+        Commands::Realm { action } => {
+            let realms = mgr.realms()?;
+            let value = match action {
+                RealmAction::Create { project, env } => {
+                    let handle = mgr
+                        .create_realm(CreateRealmRequest {
+                            env_sha256: env,
+                            env_id: None,
+                            base_path: project,
+                            policy_overrides: None,
+                        })
+                        .await?;
+                    vak_sandbox_runtime::realm::RealmStore::summary(
+                        &realms.lease(&handle.realm_id)?.record,
+                    )
+                }
+                RealmAction::List => serde_json::Value::Array(
+                    realms
+                        .list()?
+                        .iter()
+                        .map(vak_sandbox_runtime::realm::RealmStore::summary)
+                        .collect(),
+                ),
+                RealmAction::Status { realm_id } => {
+                    let lease = realms.lease(&realm_id)?;
+                    serde_json::json!({"realm": vak_sandbox_runtime::realm::RealmStore::summary(&lease.record), "change_count": realms.review(&lease.record).ok().map(|r| r.changes.len()), "ready": realms.ensure_ready(&lease.record).is_ok(), "last_receipt": realms.last_receipt(&lease.record)?, "recovery_paths": realms.recovery_paths(&lease.record)?})
+                }
+                RealmAction::Exec { realm_id, cwd, cmd } => {
+                    let (command, args) = cmd
+                        .split_first()
+                        .ok_or_else(|| anyhow::anyhow!("Provide a command and arguments"))?;
+                    if command.is_empty()
+                        || command.len() > 256
+                        || args.len() > 64
+                        || args.iter().any(|a| a.len() > 4096)
+                        || args.iter().map(String::len).sum::<usize>() > 16384
+                    {
+                        anyhow::bail!("Command arguments exceed execution bounds");
                     }
+                    let mut lease = realms.lease(&realm_id)?;
+                    realms.ensure_ready(&lease.record)?;
+                    let working = vak_sandbox_core::path::confined(&lease.record.workspace, &cwd)?;
+                    if !working.is_dir() {
+                        anyhow::bail!("Working directory is unavailable");
+                    }
+                    realms.audit(
+                        "exec_started",
+                        &realm_id,
+                        serde_json::json!({"command": command, "args": args, "cwd": cwd}),
+                    )?;
+                    lease.record.status = "running".into();
+                    realms.save(&lease.record)?;
+                    let result = vak_sandbox_runtime::process::execute(
+                        &lease.record.workspace,
+                        &working,
+                        command,
+                        args,
+                    )
+                    .await;
+                    lease.record.status = "ready".into();
+                    realms.save(&lease.record)?;
+                    let result = result.map_err(|e| anyhow::anyhow!(e))?;
+                    realms.audit("exec_finished", &realm_id, serde_json::json!({"exit_code": result.exit_code, "stopped": result.stopped}))?;
+                    serde_json::json!({"realm_id": realm_id, "result": result})
                 }
-            }
-            RealmAction::Status { realm_id } => {
-                if let Some(r) = mgr.get_realm(&realm_id).await {
-                    println!("Realm: {}", r.realm_id);
-                    println!("  Status: {:?}", r.status);
-                    println!("  Root: {}", r.realm_root.display());
-                    println!("  Writable: {}", r.writable_layer.display());
-                    println!("  Created: {}", r.created_at);
-                } else {
-                    println!("Realm not found: {}", realm_id);
+                RealmAction::Snapshot { realm_id, offset } => {
+                    let lease = realms.lease(&realm_id)?;
+                    let review = realms.snapshot(&lease.record)?;
+                    serde_json::json!({"realm_id": realm_id, "fingerprint": review.fingerprint, "can_promote": review.can_promote, "total": review.changes.len(), "offset": offset, "next_offset": (offset + 20).min(review.changes.len()), "changes": review.changes.iter().skip(offset).take(20).collect::<Vec<_>>()})
                 }
-            }
-            RealmAction::Exec { realm_id, cmd } => {
-                println!("Executing in realm {}: {:?}", realm_id, cmd);
-                println!("(Exec implementation in progress)");
-            }
-            RealmAction::Snapshot { realm_id } => {
-                println!("Creating snapshot of realm: {}", realm_id);
-                println!("(Snapshot implementation in progress)");
-            }
-            RealmAction::Promote { realm_id } => {
-                println!("Promoting realm: {}", realm_id);
-                println!("(Promotion implementation in progress - will be crash-safe with journal)");
-            }
-            RealmAction::Destroy { realm_id } => {
-                println!("Destroying realm: {}", realm_id);
-                println!("(Destroy implementation in progress)");
-            }
-        },
+                RealmAction::Read {
+                    realm_id,
+                    path,
+                    offset,
+                    original,
+                } => {
+                    let lease = realms.lease(&realm_id)?;
+                    realms.read_file(&lease.record, &path, offset, original)?
+                }
+                RealmAction::Promote {
+                    realm_id,
+                    fingerprint,
+                    paths,
+                } => {
+                    let mut lease = realms.lease(&realm_id)?;
+                    serde_json::to_value(realms.promote(&mut lease, &fingerprint, &paths)?)?
+                }
+                RealmAction::Rollback {
+                    realm_id,
+                    transaction_id,
+                    paths,
+                } => {
+                    let mut lease = realms.lease(&realm_id)?;
+                    serde_json::to_value(realms.rollback(&mut lease, &transaction_id, &paths)?)?
+                }
+                RealmAction::Recover { realm_id, paths } => {
+                    let mut lease = realms.lease(&realm_id)?;
+                    serde_json::to_value(realms.recover(&mut lease, &paths)?)?
+                }
+                RealmAction::Destroy { realm_id } => {
+                    let lease = realms.lease(&realm_id)?;
+                    realms.destroy(&lease)?;
+                    serde_json::json!({"realm_id": realm_id, "destroyed": true})
+                }
+            };
+            println!("{}", serde_json::to_string(&value)?);
+        }
         Commands::Status { realm_id } => {
             if let Some(id) = realm_id {
                 if let Some(r) = mgr.get_realm(&id).await {
@@ -251,7 +485,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Health => {
             let realms = mgr.list_realms().await;
-            let alive = realms.iter().filter(|r| mgr.heartbeat_monitor().is_alive(&r.realm_id)).count();
+            let alive = realms
+                .iter()
+                .filter(|r| mgr.heartbeat_monitor().is_alive(&r.realm_id))
+                .count();
             println!("Health:");
             println!("  Realms: {}", realms.len());
             println!("  Alive: {}", alive);
@@ -259,4 +496,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_process_options_parse_without_treating_them_as_the_command() {
+        let cli = Cli::try_parse_from([
+            "vaksb",
+            "run",
+            "--workspace",
+            "/tmp/project",
+            "--cwd",
+            "/tmp/project",
+            "--timeout-seconds",
+            "30",
+            "--max-output-bytes",
+            "32768",
+            "--",
+            "/bin/echo",
+            "ready",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Commands::Run { timeout_seconds: Some(30), max_output_bytes: Some(32768), command, .. } if command == "/bin/echo")
+        );
+    }
+
+    #[test]
+    fn process_limits_reject_values_outside_the_supported_bounds() {
+        for (flag, value) in [
+            ("--timeout-seconds", "0"),
+            ("--timeout-seconds", "301"),
+            ("--max-output-bytes", "1023"),
+            ("--max-output-bytes", "262145"),
+        ] {
+            assert!(Cli::try_parse_from(["vaksb", "run", flag, value, "--", "/bin/echo"]).is_err());
+        }
+    }
 }

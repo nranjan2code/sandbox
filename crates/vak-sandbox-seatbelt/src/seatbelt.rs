@@ -140,6 +140,7 @@ mod macos {
                 };
                 let profile_str = profile.generate();
                 let mut cmd = Command::new("sandbox-exec");
+                cmd.process_group(0);
                 cmd.arg("-p").arg(&profile_str);
                 cmd.arg("--");
                 let full_cmd = format!("{} {}", shell_quote(&plan.command), plan.args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "));
@@ -147,22 +148,25 @@ mod macos {
                 if let Some(cwd) = &plan.cwd {
                     cmd.current_dir(cwd);
                 }
-                for (k, v) in &plan.policy.env.set {
-                    cmd.env(k, v);
-                }
+                cmd.env_clear();
+                cmd.envs(&plan.policy.env.set);
                 for (k, v) in &plan.env {
-                    if plan.policy.env.allow.is_empty() || plan.policy.env.allow.contains(k) {
+                    if plan.policy.env.allow.contains(k) {
                         cmd.env(k, v);
                     }
                 }
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
                 let child = cmd.spawn().map_err(|e| Error::Backend(e.to_string()))?;
+                let process_group_id = child.id();
                 Ok(Box::new(SeatbeltEnv {
                     id: uuid::Uuid::new_v4().to_string(),
                     mode: SandboxMode::Process,
                     policy: plan.policy.clone(),
-                    child: Mutex::new(child),
+                    process_group_id,
+                    child: Mutex::new(Some(child)),
+                    kill: Mutex::new(None),
+                    process_spec: Some((plan.command.clone(), plan.args.clone())),
                 }) as Box<dyn SandboxEnv>)
             })
         }
@@ -178,6 +182,7 @@ mod macos {
                 let profile_str = profile.generate();
                 // Create a shell in the realm for interactive/work execution
                 let mut cmd = Command::new("sandbox-exec");
+                cmd.process_group(0);
                 cmd.arg("-p").arg(&profile_str);
                 cmd.arg("--");
                 cmd.arg("sh");
@@ -188,11 +193,15 @@ mod macos {
                 cmd.stderr(Stdio::piped());
                 cmd.stdin(Stdio::piped());
                 let child = cmd.spawn().map_err(|e| Error::Backend(e.to_string()))?;
+                let process_group_id = child.id();
                 Ok(Box::new(SeatbeltEnv {
                     id: plan.id,
                     mode: SandboxMode::Realm,
                     policy: plan.policy.clone(),
-                    child: Mutex::new(child),
+                    process_group_id,
+                    child: Mutex::new(Some(child)),
+                    kill: Mutex::new(None),
+                    process_spec: None,
                 }) as Box<dyn SandboxEnv>)
             })
         }
@@ -202,8 +211,11 @@ mod macos {
         id: String,
         mode: SandboxMode,
         policy: Policy,
+        process_group_id: Option<u32>,
         #[allow(dead_code)]
-        child: Mutex<tokio::process::Child>,
+        child: Mutex<Option<tokio::process::Child>>,
+        kill: Mutex<Option<oneshot::Sender<()>>>,
+        process_spec: Option<(String, Vec<String>)>,
     }
 
     impl SandboxEnv for SeatbeltEnv {
@@ -214,10 +226,55 @@ mod macos {
             let cmd = cmd.to_string();
             let args: Vec<String> = args.to_vec();
             let policy = self.policy.clone();
+            let mode = self.mode;
             Box::pin(async move {
                 let (tx_out, rx_out) = mpsc::channel(256);
                 let (tx_err, rx_err) = mpsc::channel(256);
                 let (tx_exit, rx_exit) = oneshot::channel();
+
+                if mode == SandboxMode::Process {
+                    if self.process_spec.as_ref().is_some_and(|(planned, planned_args)| planned != &cmd || planned_args != &args) {
+                        self.destroy().await?;
+                        return Err(Error::Backend("exec command differs from the command approved by the process plan".into()));
+                    }
+                    let mut child = self.child.lock().await.take().ok_or_else(|| Error::Backend("process was already started".into()))?;
+                    let stdout = child.stdout.take().ok_or_else(|| Error::Backend("sandbox process stdout unavailable".into()))?;
+                    let stderr = child.stderr.take().ok_or_else(|| Error::Backend("sandbox process stderr unavailable".into()))?;
+                    let (kill_tx, mut kill_rx) = oneshot::channel();
+                    *self.kill.lock().await = Some(kill_tx);
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut reader = stdout;
+                        let mut buffer = [0_u8; 8192];
+                        loop {
+                            let Ok(count) = reader.read(&mut buffer).await else { break; };
+                            if count == 0 { break; }
+                            if tx_out.send(String::from_utf8_lossy(&buffer[..count]).into_owned()).await.is_err() { break; }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut reader = stderr;
+                        let mut buffer = [0_u8; 8192];
+                        loop {
+                            let Ok(count) = reader.read(&mut buffer).await else { break; };
+                            if count == 0 { break; }
+                            if tx_err.send(String::from_utf8_lossy(&buffer[..count]).into_owned()).await.is_err() { break; }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let code = tokio::select! {
+                            status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
+                            _ = &mut kill_rx => {
+                                let _ = child.start_kill();
+                                let _ = child.wait().await;
+                                -1
+                            }
+                        };
+                        let _ = tx_exit.send(code);
+                    });
+                    return Ok(ExecHandle { stdout: rx_out, stderr: rx_err, exit_code: rx_exit });
+                }
 
                 let profile = SeatbeltProfile {
                     _workspace: std::path::PathBuf::from("/tmp"),
@@ -245,21 +302,27 @@ mod macos {
                     match child {
                         Ok(mut c) => {
                             if let Some(stdout) = c.stdout.take() {
-                                use tokio::io::{AsyncBufReadExt, BufReader};
-                                let mut reader = BufReader::new(stdout).lines();
+                                use tokio::io::AsyncReadExt;
+                                let mut reader = stdout;
                                 let tx = tx_out.clone();
                                 tokio::spawn(async move {
-                                    while let Ok(Some(line)) = reader.next_line().await {
-                                        let _ = tx.send(line).await;
+                                    let mut buffer = [0_u8; 8192];
+                                    loop {
+                                        let Ok(count) = reader.read(&mut buffer).await else { break; };
+                                        if count == 0 { break; }
+                                        if tx.send(String::from_utf8_lossy(&buffer[..count]).into_owned()).await.is_err() { break; }
                                     }
                                 });
                             }
                             if let Some(stderr) = c.stderr.take() {
-                                use tokio::io::{AsyncBufReadExt, BufReader};
-                                let mut reader = BufReader::new(stderr).lines();
+                                use tokio::io::AsyncReadExt;
+                                let mut reader = stderr;
                                 tokio::spawn(async move {
-                                    while let Ok(Some(line)) = reader.next_line().await {
-                                        let _ = tx_err.send(line).await;
+                                    let mut buffer = [0_u8; 8192];
+                                    loop {
+                                        let Ok(count) = reader.read(&mut buffer).await else { break; };
+                                        if count == 0 { break; }
+                                        if tx_err.send(String::from_utf8_lossy(&buffer[..count]).into_owned()).await.is_err() { break; }
                                     }
                                 });
                             }
@@ -283,6 +346,19 @@ mod macos {
 
         fn destroy(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
             Box::pin(async move {
+                if let Some(kill) = self.kill.lock().await.take() {
+                    let _ = kill.send(());
+                }
+                if let Some(pid) = self.process_group_id {
+                    let _ = std::process::Command::new("/bin/kill").arg("-KILL").arg(format!("-{pid}"))
+                        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+                }
+                if let Some(child) = self.child.lock().await.as_mut() {
+                    if child.try_wait().map_err(|e| Error::Backend(e.to_string()))?.is_none() {
+                        child.start_kill().map_err(|e| Error::Backend(e.to_string()))?;
+                        let _ = child.wait().await;
+                    }
+                }
                 Ok(())
             })
         }

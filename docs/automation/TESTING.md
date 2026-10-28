@@ -60,7 +60,7 @@ crates/*/src/tests.rs       # Unit tests in modules
 - ✅ Bad hash rejection
 
 ### Runtime Security
-- ✅ Realm isolation
+- ⚠️ Realm manager/lifecycle scaffolding only; this does not establish end-to-end filesystem isolation or promotion
 - ✅ Heartbeat monitoring
 - ✅ Lifecycle management
 
@@ -88,3 +88,10 @@ GitHub Actions workflow for:
 - Core: >90%
 - Security-critical (path, policy): 100%
 - Integration paths: Comprehensive
+
+
+## Durable Realm verification (2026-10-28)
+
+Runtime tests cover process-independent state, complete reviewed promotion, original preservation before promotion, creation/modification/deletion rollback, user-edit conflict refusal, stale/incomplete candidate rejection, stable OS locks, protected paths, symlinks, partial apply recovery, commit/rollback metadata interruption, and visible/discardable interrupted creation. Run `cargo test --locked --workspace`.
+
+The Vakyartha sibling's `node scripts/sandbox-check.ts` exercises the actual helper through agent tool adapters, approvals/logging, containment, repeated Realm commands, review/read, denied/approved promotion, reopen/resume, rollback, conflict refusal and destroy. `node scripts/settings-check.ts` checks the real UI and confirmation path in WebKit at 1100/620/375 px. These are mechanism/outcome checks of explicit tool calls; they do not prove an autonomous model will choose the right operations or generate correct code.

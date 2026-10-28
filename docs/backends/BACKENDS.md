@@ -6,11 +6,11 @@ vak-sandbox uses a backend-agnostic trait system. Each backend implements OS-spe
 ## Seatbelt (macOS) - Implemented
 
 ### Capabilities
-- Process jail: ✅
-- Realm isolation: 🚧 (in progress)
-- Promotion: 🚧
+- Process jail: ✅ (one-shot command containment; workspace path, network denial and optional wall-time/output bounds)
+- Retained Realm execution: ✅ (runtime-managed project copies executed through the process jail)
+- Promotion: ✅ (runtime-owned reviewed manifests, locks, durable candidates/backups, recovery and rollback; not a low-level backend privilege)
 - Network control: ✅ (fine-grained)
-- Resource limits: ⚠️ (limited)
+- Resource limits: ⚠️ (memory and CPU quotas are not enforced; CLI can impose optional wall-time/output caps)
 - Symlink protection: ✅ (app-level)
 
 ### Profile Generation
