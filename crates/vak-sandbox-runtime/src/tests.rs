@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod cases {
     use crate::{CreateRealmRequest, SandboxManager};
     use std::sync::Arc;
     use tempfile::TempDir;

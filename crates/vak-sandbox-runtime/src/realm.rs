@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vak_sandbox_core::path::confined;
@@ -11,8 +11,8 @@ use vak_sandbox_env::{sha256_bytes, sha256_file};
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRIES: usize = 50_000;
 type Result<T> = io::Result<T>;
-fn invalid(message: impl ToString) -> io::Error {
-    io::Error::other(message.to_string())
+fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::other(message)
 }
 fn safe(root: &Path, relative: &str) -> Result<PathBuf> {
     confined(root, relative).map_err(invalid)
@@ -28,7 +28,19 @@ fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
     serde_json::from_slice(&fs::read(path)?).map_err(invalid)
 }
 fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    if !path.exists() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("Missing directory parent"))?;
+        if !parent.exists() {
+            private_dir(parent)?;
+        }
+        fs::create_dir(path)?;
+        File::open(parent)?.sync_all()?;
+    }
+    if !fs::symlink_metadata(path)?.is_dir() {
+        return Err(invalid("Control path must be a real directory"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -83,6 +95,7 @@ fn id(value: &str) -> Result<()> {
     }
 }
 
+#[must_use]
 pub fn excluded(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
@@ -104,8 +117,9 @@ pub fn excluded(name: &str) -> bool {
         || lower.starts_with("id_rsa")
         || lower.starts_with("id_ed25519")
         || lower.starts_with("id_ecdsa")
-        || lower.ends_with(".pem")
-        || lower.ends_with(".key")
+        || lower
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| matches!(extension, "pem" | "key"))
 }
 fn protected(relative: &str) -> bool {
     Path::new(relative)
@@ -245,6 +259,8 @@ pub struct RealmRecord {
     pub status: String,
     pub baseline: Manifest,
     pub last_transaction: Option<String>,
+    #[serde(default)]
+    pub active_transaction: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Change {
@@ -254,6 +270,23 @@ pub struct Change {
     pub conflict: bool,
     pub blocked: bool,
 }
+fn recovery_matches(change: &Change, current: Option<&Version>) -> bool {
+    if current == change.before.as_ref() || current == change.after.as_ref() {
+        return true;
+    }
+    let Some(current) = current.filter(|v| v.kind == "directory") else {
+        return false;
+    };
+    [change.before.as_ref(), change.after.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|version| {
+            let mut temporary = version.clone();
+            temporary.mode |= 0o700;
+            temporary.kind == "directory" && &temporary == current
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
     pub realm_id: String,
@@ -284,12 +317,34 @@ pub struct Receipt {
 pub struct RealmLease {
     pub record: RealmRecord,
     _lock: File,
+    execution: File,
+    lock_path: PathBuf,
+    completion_path: PathBuf,
+}
+impl RealmLease {
+    /// Host-owned supervisor receipt path for this Realm's most recent execution.
+    #[must_use]
+    pub fn execution_receipt(&self) -> &Path {
+        &self.completion_path
+    }
+
+    /// Share the execution gate while retaining exclusive record ownership.
+    /// Other Realm operations acquire both locks exclusively.
+    ///
+    /// # Errors
+    /// Returns lock errors; commands must not start unless the handoff is retained.
+    pub fn execution_lock(&self) -> Result<PathBuf> {
+        self.execution.lock_shared()?;
+        Ok(self.lock_path.clone())
+    }
 }
 #[derive(Debug)]
 pub struct RealmStore {
     root: PathBuf,
 }
 impl RealmStore {
+    /// # Errors
+    /// Returns errors creating, validating, securing or synchronizing the private control directories.
     pub fn open(root: &Path) -> Result<Self> {
         private_dir(root)?;
         for name in [
@@ -299,6 +354,7 @@ impl RealmStore {
             "state/locks",
             "state/promotions",
             "state/snapshots",
+            "state/executions",
         ] {
             private_dir(&root.join(name))?;
         }
@@ -321,6 +377,12 @@ impl RealmStore {
         id(realm_id)?;
         safe(&self.root, &format!("state/records/{realm_id}.json"))
     }
+    /// # Errors
+    /// Returns lock, serialization, write or sync errors for the append-only audit trail.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Preserve ownership of serialized audit payloads at the public boundary."
+    )]
     pub fn audit(&self, event: &str, realm_id: &str, details: serde_json::Value) -> Result<()> {
         let file = private_options()
             .write(true)
@@ -338,15 +400,21 @@ impl RealmStore {
         audit.write_all(&line)?;
         audit.sync_all()
     }
+    #[must_use]
     pub fn summary(record: &RealmRecord) -> serde_json::Value {
         serde_json::json!({"realm_id": record.realm_id, "workspace": record.workspace, "base_path": record.base_path, "created_at": record.created_at, "status": record.status, "last_transaction": record.last_transaction, "entries": record.baseline.len(), "bytes": record.baseline.values().map(|v| v.bytes).sum::<u64>()})
     }
+    /// # Errors
+    /// Rejects invalid IDs and propagates atomic control-record persistence errors.
     pub fn save(&self, record: &RealmRecord) -> Result<()> {
         atomic_json(&self.metadata(&record.realm_id)?, record)
     }
+    /// # Errors
+    /// Rejects invalid ownership, unsafe workspace paths, missing records and busy locks.
     pub fn lease(&self, realm_id: &str) -> Result<RealmLease> {
         id(realm_id)?;
         let lock = self.lock(realm_id)?;
+        let execution = self.lock(&format!("execution-{realm_id}"))?;
         let record: RealmRecord = read_json(&self.metadata(realm_id)?)?;
         if record.realm_id != realm_id
             || record.workspace != self.root.join("realms").join(realm_id).join("workspace")
@@ -357,34 +425,73 @@ impl RealmStore {
         Ok(RealmLease {
             record,
             _lock: lock,
+            execution,
+            completion_path: self
+                .root
+                .join("state/executions")
+                .join(format!("{realm_id}.json")),
+            lock_path: self
+                .root
+                .join("state/locks")
+                .join(format!("execution-{realm_id}")),
         })
     }
+    /// Mark a fresh execution unverified before persisting running state.
+    ///
+    /// # Errors
+    /// Requires a ready leased Realm and durable initial completion/record writes.
+    pub fn begin_execution(&self, lease: &mut RealmLease) -> Result<()> {
+        self.ensure_ready(&lease.record)?;
+        atomic_json(
+            &lease.completion_path,
+            &vak_sandbox_core::backend::ProcessCompletion {
+                cleanup_verified: false,
+                exit_code: -1,
+            },
+        )?;
+        lease.record.status = "running".into();
+        self.save(&lease.record)
+    }
+    /// # Errors
+    /// Rejects unsafe project roots, retention limits, copy conflicts, unsupported files and storage errors.
     pub fn create(&self, source: Option<&Path>) -> Result<RealmRecord> {
+        self.create_copy(source, true)
+    }
+    /// Copy a verified stored environment without granting promotion into its cache.
+    ///
+    /// # Errors
+    /// Rejects invalid/corrupt environment digests and propagates bounded copy errors.
+    pub fn create_environment(&self, digest: &str) -> Result<RealmRecord> {
+        let store = vak_sandbox_env::EnvStore::new(&self.root).map_err(invalid)?;
+        let source = store.get_env_base(digest).map_err(invalid)?;
+        self.create_copy(Some(&source), false)
+    }
+    fn create_copy(&self, source: Option<&Path>, project: bool) -> Result<RealmRecord> {
         let _creation_lock = self.lock("creation")?;
         if self.list()?.len() >= 32 {
             return Err(invalid(
                 "At most 32 Realms may be retained; destroy an unused Realm first",
             ));
         }
-        let base_path = source.map(Path::canonicalize).transpose()?;
-        if let Some(base) = &base_path {
-            if !base.is_dir()
+        let source = source.map(Path::canonicalize).transpose()?;
+        let base_path = if project { source.clone() } else { None };
+        if let Some(base) = &base_path
+            && (!base.is_dir()
                 || base.parent().is_none()
                 || ["/Users", "/home", "/System", "/Library", "/private", "/var"]
                     .iter()
                     .any(|v| base == Path::new(v))
                 || std::env::var_os("HOME").is_some_and(|home| base == Path::new(&home))
                 || self.root.starts_with(base)
-                || base.starts_with(&self.root)
-            {
-                return Err(invalid(
-                    "Choose a project folder separate from the Realm control store",
-                ));
-            }
+                || base.starts_with(&self.root))
+        {
+            return Err(invalid(
+                "Choose a project folder separate from the Realm control store",
+            ));
         }
         let realm_id = Uuid::new_v4().to_string();
         let workspace = self.root.join("realms").join(&realm_id).join("workspace");
-        let baseline = if let Some(base) = &base_path {
+        let baseline = if let Some(base) = &source {
             scan(base, true)?
         } else {
             Manifest::new()
@@ -398,10 +505,11 @@ impl RealmStore {
             status: "creating".into(),
             baseline,
             last_transaction: None,
+            active_transaction: None,
         };
         self.save(&record)?;
         let result = (|| {
-            if let Some(base) = &record.base_path {
+            if let Some(base) = &source {
                 copy_manifest(base, &workspace, &record.baseline)?;
             }
             record.status = "ready".into();
@@ -419,6 +527,8 @@ impl RealmStore {
         }
         result
     }
+    /// # Errors
+    /// Returns directory or control-record validation errors instead of hiding corrupt state.
     pub fn list(&self) -> Result<Vec<RealmRecord>> {
         let mut records = Vec::new();
         for entry in fs::read_dir(self.root.join("state/records"))? {
@@ -432,15 +542,16 @@ impl RealmStore {
         records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(records)
     }
+    /// # Errors
+    /// Returns scan, confinement, version or metadata-bound errors; no host changes are applied.
     pub fn review(&self, record: &RealmRecord) -> Result<Review> {
         let current = scan(&record.workspace, false)?;
         let mut changes = Vec::new();
-        for name in record
-            .baseline
-            .keys()
-            .chain(current.keys())
-            .collect::<BTreeSet<_>>()
-        {
+        // This set deliberately sorts AND deduplicates paths shared by both
+        // manifests. Iterating the chained keys would apply modified files twice.
+        let mut paths: BTreeSet<_> = record.baseline.keys().collect();
+        paths.extend(current.keys());
+        for name in paths {
             let before = record.baseline.get(name).cloned();
             let after = current.get(name).cloned();
             if before == after {
@@ -482,6 +593,8 @@ impl RealmStore {
             can_promote,
         })
     }
+    /// # Errors
+    /// Returns review validation or durable snapshot/audit persistence errors.
     pub fn snapshot(&self, record: &RealmRecord) -> Result<Review> {
         let review = self.review(record)?;
         atomic_json(
@@ -498,6 +611,8 @@ impl RealmStore {
         )?;
         Ok(review)
     }
+    /// # Errors
+    /// Rejects invalid paths, unavailable versions, non-files, invalid offsets and read errors.
     pub fn read_file(
         &self,
         record: &RealmRecord,
@@ -521,7 +636,6 @@ impl RealmStore {
         if v.kind != "file" || offset > v.bytes {
             return Err(invalid("Expected a file and a byte offset within its size"));
         }
-        use std::io::{Seek, SeekFrom};
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
@@ -573,12 +687,19 @@ impl RealmStore {
             paths: txn.changes.iter().map(|c| c.path.clone()).collect(),
         }
     }
+    /// # Errors
+    /// Rejects stale/incomplete review, conflicts, unsupported changes and persistence failures. Failed apply attempts restore backups or require explicit recovery.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep ordered host mutations and rollback handling in one auditable transaction."
+    )]
     pub fn promote(
         &self,
         lease: &mut RealmLease,
         fingerprint: &str,
         paths: &[String],
     ) -> Result<Receipt> {
+        self.ensure_ready(&lease.record)?;
         let _project_lock = self.project_lock(&lease.record)?;
         if !self.pending(&lease.record)?.is_empty() {
             return Err(invalid(
@@ -639,6 +760,8 @@ impl RealmStore {
         }
         // Every backup and immutable candidate is durable before the first host mutation.
         atomic_json(&directory.join("transaction.json"), &txn)?;
+        lease.record.active_transaction = Some(txn.id.clone());
+        self.save(&lease.record)?;
         txn.phase = "applying".into();
         atomic_json(&directory.join("transaction.json"), &txn)?;
         let apply = (|| {
@@ -647,34 +770,51 @@ impl RealmStore {
                     return Err(invalid("Original project changed after review"));
                 }
             }
+            // Temporary owner access permits descendants to be installed before
+            // final read-only directory modes. These exact transient modes are
+            // recoverable states derived from the journal's reviewed versions.
+            for change in &txn.changes {
+                let directory = change
+                    .after
+                    .as_ref()
+                    .or(change.before.as_ref())
+                    .filter(|v| v.kind == "directory");
+                if let Some(directory) = directory {
+                    Self::apply_version(&base, &change.path, Some(directory), Path::new(""))?;
+                }
+            }
             for (index, change) in txn
                 .changes
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| c.after.is_some())
+                .filter(|(_, c)| c.after.as_ref().is_some_and(|v| v.kind != "directory"))
             {
                 if version(&safe(&base, &change.path)?)? != change.before {
                     return Err(invalid("Original project changed immediately before apply"));
                 }
-                self.apply_version(
+                Self::apply_version(
                     &base,
                     &change.path,
-                    &change.after,
+                    change.after.as_ref(),
                     &directory.join("after").join(index.to_string()),
                 )?;
             }
             for change in txn.changes.iter().rev().filter(|c| c.after.is_none()) {
-                if version(&safe(&base, &change.path)?)? != change.before {
+                if !recovery_matches(change, version(&safe(&base, &change.path)?)?.as_ref()) {
                     return Err(invalid(
                         "Original project changed immediately before deletion",
                     ));
                 }
-                self.apply_version(&base, &change.path, &None, Path::new(""))?;
+                Self::apply_version(&base, &change.path, None, Path::new(""))?;
             }
+            Self::finish_directory_modes(&base, &txn.changes, false)?;
             Ok(())
         })();
         if let Err(error) = apply {
-            let recovered = self.restore(&mut txn, &directory);
+            let recovered = Self::restore(&mut txn, &directory).and_then(|()| {
+                lease.record.active_transaction = None;
+                self.save(&lease.record)
+            });
             return Err(invalid(format!(
                 "Promotion failed: {error}. Recovery: {}",
                 if recovered.is_ok() {
@@ -688,6 +828,7 @@ impl RealmStore {
         atomic_json(&directory.join("transaction.json"), &txn)?;
         lease.record.baseline = txn.new_baseline.clone();
         lease.record.last_transaction = Some(txn.id.clone());
+        lease.record.active_transaction = None;
         self.save(&lease.record)?;
         self.audit(
             "promoted",
@@ -697,20 +838,19 @@ impl RealmStore {
         Ok(Self::receipt(&txn))
     }
     fn apply_version(
-        &self,
         base: &Path,
         relative: &str,
-        wanted: &Option<Version>,
+        wanted: Option<&Version>,
         staged: &Path,
     ) -> Result<()> {
         let target = safe(base, relative)?;
         if let Some(v) = wanted {
             if v.kind == "directory" {
-                fs::create_dir_all(&target)?;
+                private_dir(&target)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&target, fs::Permissions::from_mode(v.mode))?;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(v.mode | 0o700))?;
                 }
             } else {
                 let bytes = fs::read(staged)?;
@@ -734,11 +874,32 @@ impl RealmStore {
         }
         Ok(())
     }
-    fn restore(&self, txn: &mut Transaction, directory: &Path) -> Result<()> {
+    fn finish_directory_modes(base: &Path, changes: &[Change], before: bool) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for change in changes.iter().rev() {
+                if let Some(version) = (if before {
+                    &change.before
+                } else {
+                    &change.after
+                })
+                .as_ref()
+                .filter(|v| v.kind == "directory")
+                {
+                    let target = safe(base, &change.path)?;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(version.mode))?;
+                    File::open(&target)?.sync_all()?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn restore(txn: &mut Transaction, directory: &Path) -> Result<()> {
         // Refuse rollback over subsequent user edits, even during crash recovery.
         for c in &txn.changes {
             let current = version(&safe(&txn.base_path, &c.path)?)?;
-            if current != c.before && current != c.after {
+            if !recovery_matches(c, current.as_ref()) {
                 return Err(invalid(format!("Recovery conflict: {}", c.path)));
             }
         }
@@ -750,19 +911,27 @@ impl RealmStore {
             .enumerate()
             .filter(|(_, c)| c.before.is_some())
         {
-            self.apply_version(
+            if c.before.as_ref().is_some_and(|v| v.kind != "directory")
+                && version(&safe(&txn.base_path, &c.path)?)? == c.before
+            {
+                continue;
+            }
+            Self::apply_version(
                 &txn.base_path,
                 &c.path,
-                &c.before,
+                c.before.as_ref(),
                 &directory.join("before").join(index.to_string()),
             )?;
         }
         for c in txn.changes.iter().rev().filter(|c| c.before.is_none()) {
-            self.apply_version(&txn.base_path, &c.path, &None, Path::new(""))?;
+            Self::apply_version(&txn.base_path, &c.path, None, Path::new(""))?;
         }
+        Self::finish_directory_modes(&txn.base_path, &txn.changes, true)?;
         txn.phase = "rolled_back".into();
         atomic_json(&directory.join("transaction.json"), txn)
     }
+    /// # Errors
+    /// Returns invalid transaction, ownership, missing-file or decoding errors.
     pub fn last_receipt(&self, record: &RealmRecord) -> Result<Option<Receipt>> {
         record
             .last_transaction
@@ -782,6 +951,8 @@ impl RealmStore {
             })
             .transpose()
     }
+    /// # Errors
+    /// Returns errors reading or validating pending transaction ownership and journal state.
     pub fn recovery_paths(&self, record: &RealmRecord) -> Result<Vec<String>> {
         Ok(self
             .pending(record)?
@@ -791,12 +962,15 @@ impl RealmStore {
             .into_iter()
             .collect())
     }
+    /// # Errors
+    /// Rejects non-latest/uncommitted receipts, mismatched paths, later edits and persistence/recovery errors.
     pub fn rollback(
         &self,
         lease: &mut RealmLease,
         transaction_id: &str,
         paths: &[String],
     ) -> Result<Receipt> {
+        self.ensure_ready(&lease.record)?;
         let _project_lock = self.project_lock(&lease.record)?;
         let directory = self.transaction_path(transaction_id)?;
         let mut txn: Transaction = read_json(&directory.join("transaction.json"))?;
@@ -826,7 +1000,10 @@ impl RealmStore {
                 ));
             }
         }
-        self.restore(&mut txn, &directory)?;
+        lease.record.active_transaction = Some(txn.id.clone());
+        self.save(&lease.record)?;
+        Self::restore(&mut txn, &directory)?;
+        lease.record.active_transaction = None;
         lease.record.baseline = txn.previous_baseline.clone();
         lease.record.last_transaction = None;
         self.save(&lease.record)?;
@@ -837,6 +1014,8 @@ impl RealmStore {
         )?;
         Ok(Self::receipt(&txn))
     }
+    /// # Errors
+    /// Rejects stale recovery paths, interrupted creation, conflicts, invalid transaction identity and storage errors. Commands are never replayed.
     pub fn recover(&self, lease: &mut RealmLease, paths: &[String]) -> Result<Vec<Receipt>> {
         if paths != self.recovery_paths(&lease.record)? {
             return Err(invalid("Recovery paths changed; review the current status"));
@@ -846,41 +1025,64 @@ impl RealmStore {
                 "Realm creation was interrupted. Discard the partial copy and create a fresh Realm.",
             ));
         }
-        let _project_lock = self.project_lock(&lease.record)?;
+        if lease.record.status == "cleanup_failed" {
+            return Err(invalid(
+                "Cleanup was not verified. This Realm is quarantined; ordinary recovery cannot establish readiness.",
+            ));
+        }
+        if ["running", "interrupted"].contains(&lease.record.status.as_str()) {
+            let verified =
+                read_json::<vak_sandbox_core::backend::ProcessCompletion>(&lease.completion_path)
+                    .is_ok_and(|receipt| receipt.verified());
+            if !verified {
+                lease.record.status = "cleanup_failed".into();
+                self.save(&lease.record)?;
+                return Err(invalid(
+                    "Cleanup was not verified. Realm quarantined; inspect or discard it without replaying the command.",
+                ));
+            }
+        }
+        let _project_lock = lease
+            .record
+            .base_path
+            .as_ref()
+            .map(|_| self.project_lock(&lease.record))
+            .transpose()?;
         let mut receipts = Vec::new();
         for mut txn in self.pending(&lease.record)? {
             let directory = self.transaction_path(&txn.id)?;
-            self.restore(&mut txn, &directory)?;
+            Self::restore(&mut txn, &directory)?;
             lease.record.baseline = txn.previous_baseline.clone();
             receipts.push(Self::receipt(&txn));
         }
-        // Resolve a commit that reached disk before its Realm metadata update.
-        for entry in fs::read_dir(self.root.join("state/promotions"))? {
-            let entry = entry?;
-            let p = entry.path().join("transaction.json");
-            if !p.exists() {
-                continue;
-            }
-            let txn: Transaction = read_json(&p)?;
-            if txn.realm_id == lease.record.realm_id
-                && txn.phase == "committed"
-                && lease.record.baseline == txn.previous_baseline
-            {
-                lease.record.baseline = txn.new_baseline;
-                lease.record.last_transaction = Some(txn.id);
-            }
-        }
-        if let Some(transaction_id) = &lease.record.last_transaction {
+        // Only an explicitly persisted transaction identity may reconcile metadata.
+        // Equal content can recur after normal edits; it does not identify history.
+        if let Some(transaction_id) = &lease.record.active_transaction {
             let txn: Transaction = read_json(
                 &self
                     .transaction_path(transaction_id)?
                     .join("transaction.json"),
             )?;
-            if txn.phase == "rolled_back" {
-                lease.record.baseline = txn.previous_baseline;
-                lease.record.last_transaction = None;
+            if txn.realm_id != lease.record.realm_id
+                || Some(&txn.base_path) != lease.record.base_path.as_ref()
+            {
+                return Err(invalid("Invalid active transaction ownership"));
+            }
+            match txn.phase.as_str() {
+                "committed" => {
+                    lease.record.baseline = txn.new_baseline;
+                    lease.record.last_transaction = Some(txn.id);
+                }
+                "rolled_back" => {
+                    lease.record.baseline = txn.previous_baseline;
+                    if lease.record.last_transaction.as_deref() == Some(&txn.id) {
+                        lease.record.last_transaction = None;
+                    }
+                }
+                _ => return Err(invalid("Active transaction still needs recovery")),
             }
         }
+        lease.record.active_transaction = None;
         lease.record.status = "ready".into();
         self.save(&lease.record)?;
         self.audit(
@@ -890,6 +1092,8 @@ impl RealmStore {
         )?;
         Ok(receipts)
     }
+    /// # Errors
+    /// Refuses pending transactions and propagates workspace removal, metadata or audit errors.
     pub fn destroy(&self, lease: &RealmLease) -> Result<()> {
         if !self.pending(&lease.record)?.is_empty() {
             return Err(invalid(
@@ -901,34 +1105,23 @@ impl RealmStore {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
-        };
+        }
         fs::remove_file(self.metadata(&lease.record.realm_id)?)?;
         self.audit("destroyed", &lease.record.realm_id, serde_json::json!({}))?;
         Ok(())
     }
+    /// # Errors
+    /// Rejects interrupted execution, pending transactions and an unreconciled active transaction.
     pub fn ensure_ready(&self, record: &RealmRecord) -> Result<()> {
         if record.status != "ready" || !self.pending(record)?.is_empty() {
             return Err(invalid(
                 "Realm is interrupted or has a pending promotion; use explicit recovery",
             ));
         }
-        for entry in fs::read_dir(self.root.join("state/promotions"))? {
-            let path = entry?.path().join("transaction.json");
-            if !path.exists() {
-                continue;
-            }
-            let txn: Transaction = read_json(&path)?;
-            if txn.realm_id == record.realm_id
-                && ((txn.phase == "committed"
-                    && record.baseline == txn.previous_baseline
-                    && record.last_transaction.as_deref() != Some(&txn.id))
-                    || (txn.phase == "rolled_back"
-                        && record.last_transaction.as_deref() == Some(&txn.id)))
-            {
-                return Err(invalid(
-                    "Promotion receipt and Realm metadata need recovery",
-                ));
-            }
+        if record.active_transaction.is_some() {
+            return Err(invalid(
+                "Promotion receipt and Realm metadata need recovery",
+            ));
         }
         Ok(())
     }
@@ -1124,6 +1317,142 @@ mod tests {
 }
 
 #[cfg(test)]
+mod history_tests {
+    use super::*;
+    #[test]
+    fn repeated_content_never_selects_an_older_transaction() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("project");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("a"), "A").unwrap();
+        let store = RealmStore::open(&t.path().join("control")).unwrap();
+        let r = store.create(Some(&p)).unwrap();
+        let mut lease = store.lease(&r.realm_id).unwrap();
+        let mut last = None;
+        for value in ["B", "A", "B", "A"] {
+            fs::write(lease.record.workspace.join("a"), value).unwrap();
+            let review = store.snapshot(&lease.record).unwrap();
+            assert_eq!(review.changes.len(), 1);
+            let paths = review
+                .changes
+                .iter()
+                .map(|c| c.path.clone())
+                .collect::<Vec<_>>();
+            last = Some(
+                store
+                    .promote(&mut lease, &review.fingerprint, &paths)
+                    .unwrap()
+                    .transaction_id,
+            );
+            store.ensure_ready(&lease.record).unwrap();
+            store.recover(&mut lease, &[]).unwrap();
+            assert_eq!(lease.record.last_transaction, last);
+            assert!(store.review(&lease.record).unwrap().changes.is_empty());
+        }
+        store
+            .rollback(&mut lease, &last.unwrap(), &["a".into()])
+            .unwrap();
+        assert_eq!(fs::read_to_string(p.join("a")).unwrap(), "B");
+    }
+    #[tokio::test]
+    async fn leased_execution_requires_a_fresh_begin_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RealmStore::open(temp.path()).unwrap();
+        let record = store.create(None).unwrap();
+        let mut lease = store.lease(&record.realm_id).unwrap();
+        let cwd = lease.record.workspace.clone();
+        assert!(
+            crate::process::execute_leased(&mut lease, &cwd, "/bin/true", &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(lease.record.status, "ready");
+    }
+    #[test]
+    fn unverified_cleanup_stays_quarantined_and_shared_gate_blocks_other_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RealmStore::open(temp.path()).unwrap();
+        let record = store.create(None).unwrap();
+        let mut lease = store.lease(&record.realm_id).unwrap();
+        store.begin_execution(&mut lease).unwrap();
+        let path = lease.execution_lock().unwrap();
+        let supervisor = File::open(path).unwrap();
+        supervisor.lock_shared().unwrap();
+        drop(lease);
+        assert!(store.lease(&record.realm_id).is_err());
+        drop(supervisor);
+        let mut lease = store.lease(&record.realm_id).unwrap();
+        assert!(store.recover(&mut lease, &[]).is_err());
+        assert_eq!(lease.record.status, "cleanup_failed");
+        assert!(store.recover(&mut lease, &[]).is_err());
+        assert!(store.ensure_ready(&lease.record).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn read_only_parent_modes_are_finalized_after_children_and_restore_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("project");
+        fs::create_dir_all(p.join("folder")).unwrap();
+        fs::write(p.join("folder/a"), "before").unwrap();
+        let store = RealmStore::open(&t.path().join("control")).unwrap();
+        let r = store.create(Some(&p)).unwrap();
+        let mut lease = store.lease(&r.realm_id).unwrap();
+        fs::write(lease.record.workspace.join("folder/a"), "after").unwrap();
+        fs::set_permissions(
+            lease.record.workspace.join("folder"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let review = store.snapshot(&lease.record).unwrap();
+        let paths = review
+            .changes
+            .iter()
+            .map(|c| c.path.clone())
+            .collect::<Vec<_>>();
+        let receipt = store
+            .promote(&mut lease, &review.fingerprint, &paths)
+            .unwrap();
+        assert_eq!(fs::read_to_string(p.join("folder/a")).unwrap(), "after");
+        assert_eq!(
+            fs::metadata(p.join("folder")).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        store
+            .rollback(&mut lease, &receipt.transaction_id, &paths)
+            .unwrap();
+        assert_eq!(fs::read_to_string(p.join("folder/a")).unwrap(), "before");
+        assert_eq!(
+            fs::metadata(p.join("folder")).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::set_permissions(
+            lease.record.workspace.join("folder"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn empty_realm_recovers_interrupted_execution_without_a_project() {
+        let t = tempfile::tempdir().unwrap();
+        let store = RealmStore::open(t.path()).unwrap();
+        let r = store.create(None).unwrap();
+        let mut lease = store.lease(&r.realm_id).unwrap();
+        store.begin_execution(&mut lease).unwrap();
+        atomic_json(
+            &lease.completion_path,
+            &vak_sandbox_core::backend::ProcessCompletion {
+                cleanup_verified: true,
+                exit_code: 0,
+            },
+        )
+        .unwrap();
+        store.recover(&mut lease, &[]).unwrap();
+        store.ensure_ready(&lease.record).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod crash_tests {
     use super::*;
     use tempfile::TempDir;
@@ -1149,25 +1478,27 @@ mod crash_tests {
         // Commit reached disk, but the following metadata write did not.
         lease.record.baseline = txn.previous_baseline.clone();
         lease.record.last_transaction = None;
+        lease.record.active_transaction = Some(txn.id.clone());
         store.save(&lease.record).unwrap();
         store.recover(&mut lease, &[]).unwrap();
         assert!(store.review(&lease.record).unwrap().changes.is_empty());
         // Rollback reached disk, but its metadata write did not.
-        store.restore(&mut txn, &directory).unwrap();
+        lease.record.active_transaction = Some(txn.id.clone());
+        store.save(&lease.record).unwrap();
+        RealmStore::restore(&mut txn, &directory).unwrap();
         store.recover(&mut lease, &[]).unwrap();
         assert_eq!(lease.record.baseline, txn.previous_baseline);
         assert!(lease.record.last_transaction.is_none());
         // A new invocation discovers an applying journal with only one file written.
         txn.phase = "applying".into();
         atomic_json(&directory.join("transaction.json"), &txn).unwrap();
-        store
-            .apply_version(
-                &project,
-                &txn.changes[0].path,
-                &txn.changes[0].after,
-                &directory.join("after/0"),
-            )
-            .unwrap();
+        RealmStore::apply_version(
+            &project,
+            &txn.changes[0].path,
+            txn.changes[0].after.as_ref(),
+            &directory.join("after/0"),
+        )
+        .unwrap();
         drop(lease);
         let reopened = RealmStore::open(&temp.path().join("control")).unwrap();
         let mut lease = reopened.lease(&record.realm_id).unwrap();

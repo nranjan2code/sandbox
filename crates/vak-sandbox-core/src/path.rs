@@ -9,6 +9,9 @@ use std::path::{Component, Path, PathBuf};
 /// Confine a relative path to a root, rejecting escapes and symlinks
 ///
 /// This is critical for security - prevents `../../../etc/passwd` style attacks
+///
+/// # Errors
+/// Rejects unavailable roots, absolute/traversing paths, symlinks and metadata errors.
 pub fn confined(root: &Path, relative: &str) -> Result<PathBuf> {
     let rel = Path::new(relative);
 
@@ -29,7 +32,7 @@ pub fn confined(root: &Path, relative: &str) -> Result<PathBuf> {
         .canonicalize()
         .map_err(|e| Error::Backend(format!("root unavailable: {e}")))?;
 
-    let mut current = root.clone();
+    let mut current = root;
 
     // Walk each component checking for symlinks
     for component in rel.components() {
@@ -58,17 +61,23 @@ pub fn confined(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 /// Check if a path is safely contained within root
+///
+/// # Errors
+/// Returns filesystem errors when either path cannot be canonicalized.
 pub fn is_contained(root: &Path, path: &Path) -> Result<bool> {
-    let root = root.canonicalize().map_err(|e| Error::Io(e))?;
-    let path = path.canonicalize().map_err(|e| Error::Io(e))?;
+    let root = root.canonicalize().map_err(Error::Io)?;
+    let path = path.canonicalize().map_err(Error::Io)?;
 
     Ok(path.starts_with(&root))
 }
 
 /// Canonicalize and verify path doesn't escape
+///
+/// # Errors
+/// Returns an error for unavailable paths or a canonical path outside the root.
 pub fn safe_canonicalize(root: &Path, path: &Path) -> Result<PathBuf> {
-    let root = root.canonicalize().map_err(|e| Error::Io(e))?;
-    let canonical = path.canonicalize().map_err(|e| Error::Io(e))?;
+    let root = root.canonicalize().map_err(Error::Io)?;
+    let canonical = path.canonicalize().map_err(Error::Io)?;
 
     if !canonical.starts_with(&root) {
         return Err(Error::PathEscape(path.display().to_string()));

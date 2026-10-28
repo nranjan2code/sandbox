@@ -14,6 +14,10 @@ pub enum SandboxMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Independent serialized capabilities preserve the public policy schema."
+)]
 pub struct BackendCaps {
     pub process_jail: bool,
     pub realm_isolation: bool,
@@ -24,6 +28,8 @@ pub struct BackendCaps {
     pub symlink_protection: bool,
 }
 
+pub type SandboxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 pub trait SandboxBackend: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
@@ -31,14 +37,8 @@ pub trait SandboxBackend: Send + Sync {
     fn available(&self) -> bool;
     fn capabilities(&self) -> BackendCaps;
 
-    fn create_process(
-        &self,
-        plan: &ProcessPlan,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
-    fn create_realm(
-        &self,
-        plan: &RealmPlan,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SandboxEnv>>> + Send + '_>>;
+    fn create_process(&self, plan: &ProcessPlan) -> SandboxFuture<'_, Box<dyn SandboxEnv>>;
+    fn create_realm(&self, plan: &RealmPlan) -> SandboxFuture<'_, Box<dyn SandboxEnv>>;
 }
 
 pub trait SandboxEnv: Send + Sync {
@@ -50,8 +50,8 @@ pub trait SandboxEnv: Send + Sync {
         cmd: &str,
         args: &[String],
         env: &HashMap<String, String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>>;
-    fn destroy(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    ) -> SandboxFuture<'_, ExecHandle>;
+    fn destroy(&self) -> SandboxFuture<'_, ()>;
 }
 
 #[derive(Debug)]
@@ -77,4 +77,18 @@ pub struct RealmPlan {
     pub realm_root: PathBuf, // Isolated copy location
     pub policy: Policy,
     pub snapshot_on_create: bool,
+}
+
+/// Private supervisor completion receipt, separate from the target's exit status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCompletion {
+    pub cleanup_verified: bool,
+    pub exit_code: i32,
+}
+impl ProcessCompletion {
+    #[must_use]
+    pub fn verified(&self) -> bool {
+        self.cleanup_verified && (0..=255).contains(&self.exit_code)
+    }
 }

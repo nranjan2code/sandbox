@@ -9,18 +9,29 @@ pub struct MaterializedEnv {
     pub writable_layer: PathBuf,
 }
 
+/// # Errors
+/// Rejects invalid IDs, unverified environments, existing destinations, copy errors and hardening failures.
 pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<MaterializedEnv> {
     let base_root = store.get_env_base(sha256)?;
-    let realm_root = store.realms_dir().join(realm_id);
+    if uuid::Uuid::parse_str(realm_id).is_err() {
+        return Err(Error::Materialize("Invalid Realm UUID".into()));
+    }
+    let realm_root = vak_sandbox_core::path::confined(&store.realms_dir(), realm_id)
+        .map_err(|e| Error::Materialize(e.to_string()))?;
     let writable_layer = realm_root.join(".vak-sandbox-writable");
 
-    fs::create_dir_all(&realm_root)?;
-    fs::create_dir_all(&writable_layer)?;
+    fs::create_dir(&realm_root)?;
+    if base_root.join(".vak-sandbox-writable").exists() {
+        return Err(Error::Materialize(
+            "Reserved writable layer in environment".into(),
+        ));
+    }
+    fs::create_dir(&writable_layer)?;
 
     // Copy base environment contents into realm root
     #[cfg(target_os = "macos")]
     {
-        if let Err(_) = clonefile_materialize_contents(&base_root, &realm_root) {
+        if clonefile_materialize_contents(&base_root, &realm_root).is_err() {
             fallback_materialize_contents(&base_root, &realm_root)?;
         }
     }
@@ -29,6 +40,14 @@ pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<Mat
         fallback_materialize_contents(&base_root, &realm_root)?;
     }
 
+    // The writable layer is not part of the immutable environment digest.
+    fs::remove_dir(&writable_layer)?;
+    if crate::hash::sha256_tree(&realm_root)? != sha256 {
+        return Err(Error::Materialize(
+            "Materialized environment integrity failed".into(),
+        ));
+    }
+    fs::create_dir(&writable_layer)?;
     harden_base(&realm_root, &writable_layer)?;
 
     Ok(MaterializedEnv {
@@ -42,7 +61,8 @@ pub fn materialize(store: &EnvStore, sha256: &str, realm_id: &str) -> Result<Mat
 fn clonefile_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
     // Copy contents of src into dst using clonefile where possible.
     // Use cp -c with explicit args to avoid shell interpolation of paths.
-    let status = std::process::Command::new("cp")
+    let status = std::process::Command::new("/bin/cp")
+        .env_clear()
         .arg("-cR")
         .arg(format!("{}/.", src.display()))
         .arg(dst)
@@ -54,7 +74,8 @@ fn clonefile_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn fallback_materialize_contents(src: &Path, dst: &Path) -> Result<()> {
-    let status = std::process::Command::new("cp")
+    let status = std::process::Command::new("/bin/cp")
+        .env_clear()
         .arg("-R")
         .arg(format!("{}/.", src.display()))
         .arg(dst)
@@ -69,21 +90,23 @@ fn harden_base(realm_root: &Path, writable_layer: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = walkdir::WalkDir::new(realm_root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let p = e.path();
-                !p.starts_with(writable_layer)
-            })
-            .for_each(|e| {
-                if let Ok(meta) = e.metadata() {
-                    let mut perms = meta.permissions();
-                    let mode = perms.mode() & 0o555;
-                    perms.set_mode(mode);
-                    let _ = fs::set_permissions(e.path(), perms);
-                }
-            });
+        for entry in walkdir::WalkDir::new(realm_root)
+            .contents_first(true)
+            .follow_links(false)
+        {
+            let entry = entry.map_err(|e| Error::Materialize(e.to_string()))?;
+            if entry.path().starts_with(writable_layer) {
+                continue;
+            }
+            let meta = fs::symlink_metadata(entry.path())?;
+            if !meta.is_dir() && !meta.is_file() {
+                return Err(Error::Materialize("Unsafe environment entry".into()));
+            }
+            fs::set_permissions(
+                entry.path(),
+                fs::Permissions::from_mode(meta.permissions().mode() & 0o555),
+            )?;
+        }
     }
     Ok(())
 }

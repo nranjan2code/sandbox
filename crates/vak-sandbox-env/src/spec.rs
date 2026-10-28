@@ -78,6 +78,8 @@ pub struct MountSpec {
     pub ro: bool,
 }
 
+/// # Errors
+/// Returns file-read or TOML decoding errors. It never executes spec commands.
 pub fn load_spec(path: &Path) -> Result<EnvSpec> {
     let content = fs::read_to_string(path)?;
     let spec: EnvSpec = toml::from_str(&content)?;

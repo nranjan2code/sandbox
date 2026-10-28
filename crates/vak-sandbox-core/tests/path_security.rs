@@ -1,12 +1,13 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Security tests for path confinement
 //! Tests cover traversal, symlinks, absolute paths, and edge cases
 
 #[cfg(test)]
 mod security {
-    use vak_sandbox_core::path::{confined, is_contained, safe_canonicalize};
     use std::fs;
     use std::os::unix::fs as unix_fs;
     use tempfile::TempDir;
+    use vak_sandbox_core::path::{confined, is_contained, safe_canonicalize};
 
     #[test]
     fn reject_parent_traversal_variants() {
@@ -42,7 +43,8 @@ mod security {
     fn reject_symlink_escape() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let outside = tmp.path().parent().unwrap().join("outside_test");
+        let external = TempDir::new().unwrap();
+        let outside = external.path().join("outside_test");
         let _ = fs::create_dir_all(&outside);
         let link = root.join("badlink");
         let _ = unix_fs::symlink(&outside, &link);
@@ -59,7 +61,8 @@ mod security {
         let inside = root.join("test.txt");
         fs::write(&inside, "hi").unwrap();
         assert!(is_contained(&root, &inside).unwrap());
-        let outside = std::env::temp_dir().join("outside_12345.txt");
+        let external = TempDir::new().unwrap();
+        let outside = external.path().join("outside.txt");
         fs::write(&outside, "hi").unwrap();
         assert!(!is_contained(&root, &outside).unwrap());
         let _ = fs::remove_file(&outside);
@@ -69,7 +72,8 @@ mod security {
     fn safe_canonicalize_rejects_escape() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let outside = std::env::temp_dir().canonicalize().unwrap().join("x.txt");
+        let external = TempDir::new().unwrap();
+        let outside = external.path().canonicalize().unwrap().join("x.txt");
         let _ = fs::write(&outside, "hi");
         assert!(safe_canonicalize(&root, &outside).is_err());
         let _ = fs::remove_file(&outside);

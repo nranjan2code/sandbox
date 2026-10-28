@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod cases {
     use crate::{EnvStore, sha256_bytes, sha256_file};
     use std::fs;
     use tempfile::TempDir;

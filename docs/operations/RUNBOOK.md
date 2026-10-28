@@ -1,40 +1,84 @@
 # Operations runbook
 
-## macOS commands and durable Realms
+## Build and choose storage
 
-`vaksb run --workspace /tmp/job --cwd /tmp/job --timeout-seconds 30 --max-output-bytes 32768 -- /bin/pwd` runs a process in the supplied workspace with network denied. The raw run command does not make a copy. Vakyartha creates/deletes its temporary copy around a one-shot call.
+Build with `cargo build --locked --workspace`. On macOS the system C compiler builds the embedded supervisor. Check `vaksb capabilities`: contract 2 advertises supervised process lifetime and detachment gates. A declaration is not a command test. Use a specific workspace; grants covering trusted `/private/tmp` supervisor storage are rejected. The raw `run` command does not create a disposable copy.
 
-Use the same private `--store` for every Realm invocation. Its `realms/<id>/workspace` is the jailed copy; `state/` contains records, stable OS locks, audit logs, review manifests, transaction candidates, backups and journals outside that copy. The store must be separate from the project. Default CLI storage is the user's cache; Vakyartha supplies its private app data store.
+Use one private canonical `--store` outside the original project and every jailed copy. Do not place control state in a directory writable by the command. Do not use separate stores to coordinate edits to the same project.
 
-```bash
-vaksb --store /private/control realm create --project /path/to/project
-vaksb --store /private/control realm list
-vaksb --store /private/control realm status <id>
-vaksb --store /private/control realm exec <id> --cwd . -- /bin/pwd
-vaksb --store /private/control realm snapshot <id> --offset 0
-vaksb --store /private/control realm read <id> file.txt --offset 0
-vaksb --store /private/control realm read <id> file.txt --original --offset 0
+```sh
+vaksb run --workspace /path/to/copy --cwd /path/to/copy \
+  --timeout-seconds 30 --max-output-bytes 32768 -- /bin/pwd
+vaksb --store /path/to/control realm create --project /path/to/project
+vaksb --store /path/to/control realm list
+vaksb --store /path/to/control realm status REALM_ID
+vaksb --store /path/to/control realm exec REALM_ID --cwd . -- /bin/sh -c 'printf ready > proof.txt'
 ```
 
-Exec preserves copy-only writes between calls. It has a 30-second wall limit and 32 KiB output limit. No command is automatically replayed. Inspect exit code, stdout/stderr and any stop reason.
+Commands receive a minimal PATH/HOME/TMPDIR policy, network denial and explicit system read grants. There is no implicit shell. A command's first argument never grants reads. Fork/exec works; group/session detachment, indirect dispatch and `posix_spawn` are blocked. Some interpreter wrappers or build tools will fail. Explain that restriction; do not run on the host or disable the gates automatically.
 
-Snapshot records a review manifest and returns a SHA-256 fingerprint, total, next offset, and at most 20 changes. Read every page with the same fingerprint. File reads return at most 16 KiB with byte offsets and a lossy-text flag. A snapshot is not a workspace restore point. Review the actual file contents before authorization.
+## Review every changed path
 
-```bash
-vaksb --store /private/control realm promote <id> --fingerprint <exact-sha256> --paths=first.txt --paths=second.txt
-vaksb --store /private/control realm rollback <id> <receipt-id> --paths=first.txt --paths=second.txt
+```sh
+vaksb --store /path/to/control realm snapshot REALM_ID --offset 0
+vaksb --store /path/to/control realm read REALM_ID proof.txt --offset 0
+vaksb --store /path/to/control realm read REALM_ID existing.txt --original --offset 0
 ```
 
-Supply every reviewed path in order. Promotion refuses stale candidates, original-file conflicts, protected paths and unsupported types. It stages and syncs backups/candidates before any original-file mutation. Individual files are atomically replaced; multi-file changes are recoverable through the journal, not globally atomic. External readers may see intermediate files. Do not edit the same project files concurrently; external editors do not honor this store's advisory locks. Locks do not coordinate independent control stores.
+Snapshot returns a fingerprint, total, offset, next_offset and up to 20 unique sorted changes. Read all pages with the same fingerprint; restart the review if it changes. Inspect complete relevant file contents and modes, not only names or a first page. `can_promote` must be true. Conflicts/protected paths/type replacements must be resolved, not bypassed.
 
-Rollback supports only that Realm's latest committed promotion, requires the exact receipt paths and refuses to overwrite later project edits. A receipt establishes a filesystem operation, not correctness of the generated code.
+File pages return up to 16 KiB by byte offset, a version with full-file byte count/hash, `next_offset`, text and a lossy flag. Compare offsets with `version.bytes` to determine completeness; there is no independent `truncated` boolean. Lossy text is not exact binary content. A snapshot is a review manifest, not a restorable filesystem checkpoint.
 
-## Recovery and deletion
+## Apply and undo
 
-After interruption inspect status. Use its exact `recovery_paths`, in order, for `realm recover <id> --paths=...` (omit path options if the list is empty). Recovery rolls back an incomplete promotion or reconciles committed/rolled-back metadata; it never re-executes commands. Conflicting user edits or damaged backups stop recovery and require manual reconciliation. Preserve the store and receipts while investigating.
+Only the host application's existing consent policy authorizes these operations. Supply all affected paths in the order returned by the complete review.
 
-An interrupted creation remains visible as `creating`; discard it and create a fresh copy. `realm destroy <id>` removes the copy after pending-transaction checks. It does not undo promotion or delete transaction receipts/backups. Back up the whole control store before separately managing retained history.
+```sh
+vaksb --store /path/to/control realm promote REALM_ID \
+  --fingerprint EXACT_REVIEW_SHA --paths=first.txt --paths=folder/second.txt
+vaksb --store /path/to/control realm rollback REALM_ID TRANSACTION_ID \
+  --paths=first.txt --paths=folder/second.txt
+```
 
-Bounds: 512 MiB/50,000 entries/8 MiB manifest per copy; 32 retained Realms; 200 changed paths per promotion. Regular files/directories only. Symlinks, special files and file/directory type replacement fail closed. Initial copies omit common credential paths by filename. CPU, memory, process-count and disk-growth quotas are not enforced. macOS requires `/usr/bin/sandbox-exec`; Linux is unsupported.
+A committed receipt includes the Realm, transaction ID, phase and paths. Keep it. Rollback supports only that Realm's latest committed promotion and refuses later conflicting original-project edits. Destroy does not undo promotion. Do not describe isolated edits as saved to the original project before a committed receipt exists.
 
-`status` now reads durable Realm metadata. Heartbeat observations remain process-local and are not a persistent service monitor. Environment aliases and policy overrides are refused; `env check` parses a specification, and `env list` remains informational.
+Promotion stages/synchronizes immutable candidates/backups before host writes. Directory owner access may be temporarily enabled for the journaled operation; final reviewed modes are applied after descendants. Files are atomically replaced individually, not as one globally atomic multi-file change. Avoid concurrent target edits by external editors; they do not honor the store's locks.
+
+## Interruption and recovery
+
+1. Inspect `realm status`. Do not replay a command automatically.
+2. If the Realm is busy, wait for the trusted supervisor to finish cleanup; do not delete/replace lock files. Record and execution locks are stable and must not be unlinked.
+3. Use exactly the status response's `recovery_paths` in order. Omit `--paths` when the array is empty.
+4. Recover only after inspecting the interrupted state and authorizing affected paths.
+
+```sh
+vaksb --store /path/to/control realm recover REALM_ID --paths=first.txt --paths=folder/second.txt
+vaksb --store /path/to/control realm status REALM_ID
+```
+
+Recovery first requires a valid host-private cleanup receipt for interrupted execution, then restores incomplete transactions or reconciles the explicit active transaction receipt. It does not infer history from recurring content and never re-executes commands. Empty/environment Realms require no project lock for command-state recovery. A `creating` Realm should be discarded and recreated. A `cleanup_failed` Realm is quarantined: ordinary recovery will not mark it ready. Preserve/inspect it, establish that old processes are gone before manual maintenance, and explicitly discard/recreate if appropriate. Missing completion proof in a legacy interrupted Realm also quarantines it rather than guessing. A conflict/damaged backup stops recovery and requires manual reconciliation; preserve the whole control store and original project while investigating.
+
+```sh
+vaksb --store /path/to/control realm destroy REALM_ID
+```
+
+Destroy removes the isolated copy/record after pending checks. Receipts/backups remain. Back up the entire control store before separate history management. Do not remove active transaction directories or active supervisor temporary executables. Hard crashes can leave inactive private supervisor files and pre-journal staging; there is no automatic janitor.
+
+## Exit and failure interpretation
+
+| Result | Interpretation |
+| --- | --- |
+| 0 | Command observed success; inspect output and intended effects separately |
+| nonzero target exit | Command failed; retained copy may still contain partial changes |
+| 124 | CLI deadline exceeded; cleanup precedes return |
+| 125 | CLI output cap exceeded; cleanup precedes return |
+| 126 | May be the target's ordinary failure; a supervisor/protocol failure is reported separately and quarantines durable execution |
+| 143 / cancellation | Owner interruption/cancellation; inspect state before continuing |
+| invalid policy | Unsupported authority request; no automatic weakening/retry |
+| conflict / stale review | Re-review current state; do not reuse old authorization arguments |
+
+The runtime distinguishes an ordinary target exit 126 from unverified cleanup using the private completion receipt. The raw CLI also uses 126 for supervisor failure, so callers must not infer verified success from a nonzero raw exit alone. The CLI/runtime keep deadlines active even with closed streams. Owner death transfers cleanup responsibility to the native supervisors; a shared execution gate blocks new Realm operations until cleanup releases it. No CPU, memory, process-count or disk-growth quotas exist.
+
+## Limits
+
+Realm command 30 s / 32 KiB output; copy 512 MiB / 50,000 entries / 8 MiB manifest; 32 retained Realms; 200 changes per promotion; 20 changes and 16 KiB file text per page. Regular files/directories only. Common credential filenames are excluded, not secret contents. Linux execution is unavailable. Heartbeats are process-local observations, not an independent persistent service health monitor.

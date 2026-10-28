@@ -1,64 +1,35 @@
 # Contributing to vak-sandbox
 
-Thank you for your interest in contributing! This project prioritizes security, correctness, and clarity.
+Read [AGENTS.md](AGENTS.md) and the [current contract](README.md) first. Containment, durable change promotion and client authorization are different responsibilities; preserve those boundaries.
 
-## Getting Started
+## Setup and required checks
 
-1. Fork the repository
-2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/sandbox.git`
-3. Read [AGENTS.md](AGENTS.md) and [README.md](README.md)
-4. Build: `cargo build --workspace`
-5. Test: `cargo test --workspace`
+Use Rust 1.90+ / edition 2024. Native macOS execution also needs the system command-line developer tools and Seatbelt helper. The in-repo C supervisor is compiled with warnings as errors; no external sandbox service is installed.
 
-## Development Guidelines
+```sh
+cargo build --locked --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test --workspace --doc
+```
 
-### Security First
-- Never cut corners on security boundaries
-- All paths must go through `confined()` 
-- Use deny-by-default for all policies
-- Never interpolate untrusted input into shell/Seatbelt profiles
-- Add security tests for new attack vectors
+Integration tests belong in the owning crate. The root is a virtual workspace, so root-level test files are not automatically discovered. Run real macOS lifetime/policy tests; portable tests on Linux do not establish process containment there.
 
-### Code Quality
-- Rust 2024 edition
-- Follow existing style and patterns
-- Add comments explaining *why*, especially for security rationale
-- No `unwrap()`/`expect()`/`panic!()` in library code (tests are fine)
-- Run `cargo clippy --workspace` and fix warnings
-- Format with `cargo fmt`
+## Changing a boundary
 
-### Testing
-- Add unit tests for new functionality
-- Add integration tests for cross-component features
-- Add security tests for security-sensitive code
-- All tests must pass on macOS and Linux
-- Test with both debug and release builds when relevant
+- Start with a failing user-observable contract and freeze expected paths, bytes, permissions, receipts and side effects.
+- Use synthetic canaries, temporary fixtures and locally owned listeners. Do not probe actual secrets, live projects or external services to demonstrate a defect.
+- Inspect native control-descriptor ownership, group identity, owner-death behavior, lock handoff and verified completion independently of target exit codes.
+- Test both allowed work and denied authority. A fail-closed rejection is useful evidence, but does not prove a supported workflow succeeds.
+- Preserve uncertainty: invalid completion quarantines execution; later conflicts stop rollback; missing transaction identity is not guessed from equal content.
+- Reject unsupported policy/runtime combinations and explain compatibility changes. Do not relax checks, reinstall packages or substitute host execution to make tests pass.
+- Review automatic lint fixes. Sorting/deduplicating paths is semantic, even when a lint suggests removing a collection.
 
-### Commits
-- Use clear, descriptive commit messages
-- Reference issues when applicable
-- Keep commits focused
+Keep Rust unsafe code denied; no unwrap/expect/panic in libraries. Test assertions may use them. Native code is part of the trusted computing base: checked system calls, validated data, close-on-exec controls and explicit cleanup are required. Public fallible APIs document their errors.
 
-## Pull Request Process
+## Documentation and delivery
 
-1. Create a feature branch: `git checkout -b feature/my-feature`
-2. Make your changes
-3. Add/update tests
-4. Run tests: `cargo test --workspace`
-5. Run clippy: `cargo clippy --workspace`
-6. Run fmt: `cargo fmt --all --check`
-7. Commit and push
-8. Open a Pull Request with clear description
+Update the supported contract, API docs, architecture/security invariants, runbook, upgrade notes, test evidence and changelog for behavior changes. Distinguish implemented behavior from future work. A repository push is not a release, installed-helper update or client acceptance test.
 
-## Reporting Security Issues
-
-**Do not** open public issues for security vulnerabilities. Email security concerns privately.
-
-## Areas to Contribute
-
-- **Linux backends**: Landlock, seccomp-bpf, bubblewrap implementations
-- **Promotion system**: Journal, rollback, diff generation
-- **CLI**: Full vaksb implementation
-- **Tests**: Security tests, integration tests, stress tests
-- **Documentation**: Examples, tutorials, API docs
-- **Performance**: Optimization while maintaining security
+Review the staged diff and scan for credential patterns without printing any matches. Commit only the intended work and preserve unrelated edits. Never commit local credentials, caches, binaries, copied workspaces or private control state. Report security concerns through an appropriate private maintainer channel, not a public issue containing exploit details.

@@ -26,6 +26,7 @@ struct HeartbeatEntry {
 }
 
 impl HeartbeatMonitor {
+    #[must_use]
     pub fn new(timeout_secs: u64) -> Self {
         Self {
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
@@ -45,31 +46,34 @@ impl HeartbeatMonitor {
         }
     }
 
+    #[must_use]
     pub fn is_alive(&self, realm_id: &str) -> bool {
-        if let Ok(map) = self.heartbeats.lock() {
-            if let Some(entry) = map.get(realm_id) {
-                return entry.last_seen.elapsed() < self.timeout && entry.last.alive;
-            }
+        if let Ok(map) = self.heartbeats.lock()
+            && let Some(entry) = map.get(realm_id)
+        {
+            return entry.last_seen.elapsed() < self.timeout && entry.last.alive;
         }
         false
     }
 
+    #[must_use]
     pub fn get_all(&self) -> Vec<Heartbeat> {
-        if let Ok(map) = self.heartbeats.lock() {
-            map.values().map(|e| e.last.clone()).collect()
-        } else {
-            vec![]
-        }
+        self.heartbeats.lock().map_or_else(
+            |_| vec![],
+            |map| map.values().map(|e| e.last.clone()).collect(),
+        )
     }
 
+    #[must_use]
     pub fn check_stale(&self) -> Vec<String> {
-        if let Ok(map) = self.heartbeats.lock() {
-            map.iter()
-                .filter(|(_, e)| e.last_seen.elapsed() >= self.timeout)
-                .map(|(k, _)| k.clone())
-                .collect()
-        } else {
-            vec![]
-        }
+        self.heartbeats.lock().map_or_else(
+            |_| vec![],
+            |map| {
+                map.iter()
+                    .filter(|(_, e)| e.last_seen.elapsed() >= self.timeout)
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            },
+        )
     }
 }

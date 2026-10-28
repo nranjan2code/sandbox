@@ -1,5 +1,4 @@
 use crate::{EnvSpec, Result};
-use std::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CheckReport {
@@ -14,80 +13,51 @@ pub struct CheckResult {
     pub output: String,
 }
 
+/// Inspect declared binaries without executing environment- or spec-owned code.
+/// Executable post-checks need the caller's explicit sandbox process plan.
+///
+/// # Errors
+/// Returns filesystem errors if the environment root cannot be inspected.
 pub fn check_env(spec: &EnvSpec, realm_root: &std::path::Path) -> Result<CheckReport> {
     let mut results = Vec::new();
-
     if let Some(checks) = &spec.checks {
-        // Check required bins
         for bin in &checks.required_bins {
-            let which = Command::new("which")
-                .arg(bin)
-                .current_dir(realm_root)
-                .output();
-            match which {
-                Ok(o) if o.status.success() => {
-                    results.push(CheckResult {
-                        name: format!("bin:{bin}"),
-                        ok: true,
-                        output: String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                    });
-                }
-                _ => {
-                    results.push(CheckResult {
-                        name: format!("bin:{bin}"),
-                        ok: false,
-                        output: "not found".to_string(),
-                    });
-                }
-            }
+            let found = if bin.is_empty() || bin.contains('/') || bin.contains('\\') {
+                None
+            } else {
+                [format!("bin/{bin}"), format!("usr/bin/{bin}")]
+                    .into_iter()
+                    .find_map(|relative| {
+                        let candidate =
+                            vak_sandbox_core::path::confined(realm_root, &relative).ok()?;
+                        let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+                        #[cfg(unix)]
+                        let executable = {
+                            use std::os::unix::fs::PermissionsExt;
+                            metadata.permissions().mode() & 0o111 != 0
+                        };
+                        #[cfg(not(unix))]
+                        let executable = true;
+                        (metadata.is_file() && executable).then_some(relative)
+                    })
+            };
+            results.push(CheckResult {
+                name: format!("bin:{bin}"),
+                ok: found.is_some(),
+                output: found.unwrap_or_else(|| "not found in environment".into()),
+            });
         }
-
-        // Run post checks
-        for cmd in &checks.post_check {
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-            let out = Command::new(parts[0])
-                .args(&parts[1..])
-                .current_dir(realm_root)
-                .env(
-                    "PATH",
-                    format!(
-                        "{}/usr/bin:{}/bin:{}",
-                        realm_root.display(),
-                        realm_root.display(),
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .output();
-            match out {
-                Ok(o) => {
-                    let output = if o.status.success() {
-                        String::from_utf8_lossy(&o.stdout).trim().to_string()
-                    } else {
-                        String::from_utf8_lossy(&o.stderr).trim().to_string()
-                    };
-                    results.push(CheckResult {
-                        name: format!("check:{cmd}"),
-                        ok: o.status.success(),
-                        output,
-                    });
-                }
-                Err(e) => {
-                    results.push(CheckResult {
-                        name: format!("check:{cmd}"),
-                        ok: false,
-                        output: e.to_string(),
-                    });
-                }
-            }
+        for command in &checks.post_check {
+            results.push(CheckResult {
+                name: format!("check:{command}"),
+                ok: false,
+                output: "Post-check not executed: authorize an explicit sandbox process plan"
+                    .into(),
+            });
         }
     }
-
-    let ok = results.iter().all(|r| r.ok);
     Ok(CheckReport {
-        ok,
+        ok: results.iter().all(|result| result.ok),
         checks: results,
     })
 }

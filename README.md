@@ -1,576 +1,95 @@
 # vak-sandbox
 
-**Production-grade, runtime-agnostic sandboxing for safe agent code execution with reviewable promotion.**
-
-[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-green.svg)](#testing)
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Philosophy](#philosophy)
-- [Key Features](#key-features)
-- [Architecture](#architecture)
-- [Modes](#modes)
-- [Security Model](#security-model)
-- [Platform Support](#platform-support)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Environment Management](#environment-management)
-- [Management, Heartbeat & Control Protocol](#management-heartbeat--control-protocol)
-- [CLI Usage (vaksb)](#cli-usage-vaksb)
-- [API Documentation](#api-documentation)
-- [Development](#development)
-- [Testing](#testing)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
-
-## Overview
-
-`vak-sandbox` provides two complementary isolation strategies in one cohesive system:
-
-1. **Process containment** - OS-level capability restriction (macOS Seatbelt, Linux Landlock/seccomp/bubblewrap) to jail individual processes with deny-by-default policies
-2. **Durable Realms with reviewed promotion** - Retain an isolated project copy across commands, review exact changes, apply a fingerprint-bound candidate and recover or roll back through durable receipts
-
-Built for Vakyartha's agent execution needs, `vak-sandbox` is backend-agnostic, observable, and designed to be safe by construction.
-
-## Current implementation status
-
-The macOS `vaksb run` process jail is implemented and used by Vakyartha for approved commands in a disposable, size-limited project snapshot. It supports a confined workspace and working directory, optional wall-time and output limits, and a deny-network Seatbelt profile. The tool currently enforces wall time, output and snapshot bounds; memory and CPU quotas are not enforced.
-
-`SandboxManager` now uses a durable `RealmStore`. Independent CLI invocations share saved work through `--store`. Create, list/status, bounded exec, paged review snapshots, file reads, promotion, latest-promotion rollback, interrupted-work recovery and destruction are implemented. Vakyartha exposes them through its existing integration tools and Settings. Mutation tools ask by default.
-
-Promotion stages immutable candidates and backups before writing, checks reviewed fingerprints/path lists and original versions, journals progress, and uses atomic individual-file replacement. Multi-file promotion is recoverable, not globally atomic to external readers. Locks coordinate operations in the canonical store; external editors do not honor them, so avoid concurrent target edits. Recovery never replays a command. A snapshot is a review manifest, not a restorable filesystem checkpoint.
-
-Bounds: 30 seconds/32 KiB per Realm command; 512 MiB/50,000 entries/8 MiB manifest per copy; 32 retained Realms; 200 changed paths per promotion; 20 changes or 16 KiB file text per read page. Regular files/directories only; symlinks, special files and file/directory replacement are refused. Common credential paths are excluded by filename, not content inspection. CPU, memory, process-count and disk-growth quotas are not enforced. Linux backends remain stubs.
-
-## Philosophy
-
-- **Containment and promotion are separate concerns** - `ProcessSandbox` and `RealmSandbox` are distinct modes sharing common primitives
-- **Deny by default** - Nothing is allowed unless explicitly permitted. Network is disabled by default
-- **Defense in depth** - OS-level sandboxes plus application-level checks (path confinement, env filtering, symlink protection)
-- **Crash safety** - All mutations to real workspaces go through write-ahead journals with backups and rollback capability
-- **Zero trust of paths** - All paths pass through `confined()` validation. Absolute paths, `..` traversal, and symlink escapes are rejected
-- **Minimal attack surface** - Lean dependencies, `unsafe_code = "deny"`, strict Clippy lints (`unwrap`/`expect`/`panic` denied in libraries)
-- **Observable** - Complete audit trail of creates, execs, snapshots, promotes, and undos
-
-## Key Features
-
-- **Backend-agnostic trait system** - Pluggable `SandboxBackend` implementations with capability discovery
-- **Fine-grained policies** - Control filesystem (read/write/deny), network (egress/ingress/localhost/DNS/hosts/ports), environment variables, and resources
-- **Path confinement** - Canonicalization with symlink traversal protection (ported from Vak/code)
-- **Prebuilt, distributable environments** - Content-addressed environment store with CoW materialization (macOS `clonefile`/`cp -c`, Linux reflinks/hardlinks)
-- **Hash verification** - All artifacts verified by SHA256 before use
-- **Management & orchestration** - `SandboxManager` for lifecycle management of realms and processes
-- **Heartbeat & liveness monitoring** - Track realm health with configurable timeouts, stale detection, and ping protocol
-- **Control protocol** - Structured message-based protocol for coordination (`Ping`, `Exec`, `Snapshot`, `Promote`, `Destroy`, `Status`)
-- **Environment checking** - Validate environments with required binaries and post-checks
-- **Recoverable promotion** - Durable candidates/backups, write-ahead transaction state, per-file atomic replacement, explicit recovery and rollback
-- **Cross-platform** - macOS (Seatbelt) production-ready foundation, Linux (Landlock + seccomp-bpf + bubblewrap) stubs in place
-
-## Architecture
-
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           vak-sandbox                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  CLI (vaksb)        │  Runtime Manager  │  Control Protocol            │
-│  - env mgmt         │  - lifecycle      │  - heartbeat/ping           │
-│  - realm ops        │  - orchestration  │  - status/exec/snapshot     │
-│  - status/monitor   │  - health checks  │  - promote/destroy          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                        Core (backend-agnostic)                           │
-│  - Traits: SandboxBackend, SandboxEnv                                    │
-│  - Policy: FS/Network/Env/Resource (deny-by-default)                    │
-│  - Path confinement: safe traversal, symlink protection                 │
-│  - Types: ProcessPlan, RealmPlan, ExecHandle, BackendCaps               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Backends            │  Environments      │  Security                    │
-│  - Seatbelt (macOS)  │  - EnvStore        │  - Path validation           │
-│  - Landlock (Linux)  │  - Content-addressed│ - Profile injection protect │
-│  - Bubblewrap (Linux)│  - CoW materialize │  - Env allowlisting         │
-│  - (extensible)      │  - Hash verify     │  - Audit logging            │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Crate Structure
-
-| Crate | Purpose | Status |
-| --- | --- | --- |
-| `vak-sandbox-core` | Runtime-agnostic traits, policies, path confinement, errors | Core complete |
-| `vak-sandbox-seatbelt` | macOS Seatbelt backend with safe profile generation | Process containment for disposable and retained workspaces; durable lifecycle belongs to the runtime |
-| `vak-sandbox-env` | Environment store, specs, hashing, CoW materialization, validation | Complete with tests |
-| `vak-sandbox-runtime` | Sandbox manager, heartbeat monitor, control protocol, orchestration | Complete with tests |
-| `vak-sandbox-ctl` | CLI (`vaksb`) | `run`, durable Realm lifecycle, reviewed promotion, recovery and rollback implemented |
-
-## Modes
-
-### ProcessSandbox (Single-process containment)
-
-Jail a single process with OS-level restrictions. Ideal for running untrusted commands, MCP servers, or one-off tool executions.
-
-```rust
-use vak_sandbox_core::{Policy, ProcessPlan};
-use vak_sandbox_seatbelt::SeatbeltBackend;
-use vak_sandbox_core::SandboxBackend;
-
-let policy = Policy::deny_all()
-    .allow_path_read("/usr/bin".into())
-    .allow_path_read("/bin".into())
-    .allow_path_write("/tmp/workspace".into())
-    .allow_env("PATH")
-    .allow_env("HOME");
-
-let plan = ProcessPlan {
-    command: "npm".into(),
-    args: vec!["test".into()],
-    cwd: Some("/tmp/workspace".into()),
-    env: std::collections::HashMap::new(),
-    policy,
-};
-
-let backend = SeatbeltBackend;
-let env = backend.create_process(&plan).await?;
-```
-
-### Durable Realm workspaces
-
-The runtime stores each project copy separately from its control state. Use `--store` consistently between CLI invocations; Vakyartha sets it to its private data directory. Commands run inside the copy through the Seatbelt process jail. Only explicit reviewed promotion can write the original. See the [operations runbook](docs/operations/RUNBOOK.md) for the exact CLI and recovery flow.
-
-```rust
-use vak_sandbox_runtime::{SandboxManager, CreateRealmRequest};
-use vak_sandbox_env::{EnvStore};
-use std::sync::Arc;
-
-let store = Arc::new(EnvStore::new(EnvStore::default_root())?);
-let manager = SandboxManager::new(store);
-
-let req = CreateRealmRequest {
-    env_sha256: Some("...".into()), // Use prebuilt env
-    env_id: None,
-    base_path: Some("/path/to/workspace".into()),
-    policy_overrides: None,
-};
-
-let realm = manager.create_realm(req).await?;
-// Agent works in realm.realm_root
-// Review changes, then promote (journaled, rollbackable)
-```
-
-## Security Model
-
-### Deny-by-Default
-
-- **Filesystem**: No read/write access unless explicitly in allowlists. System paths only added as needed
-- **Network**: Completely disabled by default. Must explicitly opt-in with granular controls
-- **Environment**: Empty allowlist by default - only explicitly allowed vars passed through
-- **Processes**: Fork/exec controlled by OS sandbox
-
-### Path Confinement
-
-All user-provided paths are validated through `vak_sandbox_core::path::confined()`:
-
-- Rejects absolute paths
-- Rejects `..` (parent directory) components
-- Detects and rejects symlink escapes
-- Canonicalizes roots to prevent TOCTOU issues
-- Never interpolates untrusted paths into Seatbelt profiles
-
-```rust
-use vak_sandbox_core::path::confined;
-let safe = confined(&root, "src/app.rs")?; // OK
-confined(&root, "../etc/passwd")?; // Err(PathEscape)
-confined(&root, "/etc/passwd")?;  // Err(PathEscape)
-```
-
-### Seatbelt Safety
-
-- Profile generation uses safe quoting (`sbpl_quote`) to prevent injection
-- Paths are canonicalized before insertion
-- Special characters in paths are rejected
-- Network rules are explicit and minimal
-- Default profile denies everything, explicitly allows only required operations
-
-### Environment Isolation
-
-- Only variables in `EnvPolicy.allow` are passed (plus explicitly set vars)
-- Never leaks `process.env` wholesale
-- Artifacts verified by SHA256 before materialization
-- Environments stored content-addressed in `~/.cache/vak-sandbox/`
-
-### Resource limits
-
-`ResourcePolicy` declares default values, but the current macOS backend does not enforce memory, CPU, process-count or per-file-size quotas. `vaksb run` enforces only explicitly supplied wall-time and output caps. Vakyartha also bounds its snapshot size and file count before launch.
-
-## Platform Support
-
-| Feature | macOS (Seatbelt) | Linux (Landlock/seccomp/bwrap) |
-| --- | --- | --- |
-| Process jail | ✅ Implemented | 🚧 Stubs in place |
-| Durable Realm workflow | ✅ macOS process jail + retained copy + reviewed promotion | 🚧 Planned |
-| Network control | ✅ Fine-grained | 🚧 Planned |
-| Path confinement | ✅ App-level | ✅ App-level |
-| CoW materialization | ✅ `cp -c` / clonefile | 🚧 reflinks/hardlinks |
-| Resource limits | ⚠️ CLI wall/output caps only; no memory/CPU quotas | 🚧 rlimits/cgroups |
-| Status | **Usable for process jail** | **Development** |
-
-## Installation
-
-### Prerequisites
-
-- **Rust** 1.90+ with Rust 2024 edition
-- **macOS**: `sandbox-exec` available (built-in)
-- **Linux**: `bubblewrap` (optional), kernel with Landlock support (5.13+)
-
-### Build from source
-
-```bash
-git clone https://github.com/nranjan2code/sandbox.git
-cd sandbox
-cargo build --workspace --release
-```
-
-The CLI binary `vaksb` will be at `target/release/vaksb`.
-
-### Using in your project
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-vak-sandbox-core = { git = "https://github.com/nranjan2code/sandbox" }
-vak-sandbox-runtime = { git = "https://github.com/nranjan2code/sandbox" }
-vak-sandbox-env = { git = "https://github.com/nranjan2code/sandbox" }
-```
-
-## Quick Start
-
-### Create a minimal realm
-
-```rust
-use vak_sandbox_runtime::{SandboxManager, CreateRealmRequest};
-use vak_sandbox_env::EnvStore;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let store = Arc::new(EnvStore::new(EnvStore::default_root())?);
-    let mgr = SandboxManager::new(store);
-    
-    let realm = mgr.create_realm(CreateRealmRequest {
-        env_sha256: None,
-        env_id: None,
-        base_path: None,
-        policy_overrides: None,
-    }).await?;
-    
-    println!("Created realm: {}", realm.realm_id);
-    println!("Root: {}", realm.realm_root.display());
-    Ok(())
-}
-```
-
-### Monitor heartbeats
-
-```rust
-mgr.ping(&realm.realm_id).await;
-if mgr.heartbeat_monitor().is_alive(&realm.realm_id) {
-    println!("Realm is alive");
-}
-```
-
-## Environment Management
-
-Environments are prebuilt, content-addressed, and stored in `~/.cache/vak-sandbox/` by default.
-
-### Environment Store Layout
-
-```text
-~/.cache/vak-sandbox/
-├── artifacts/    # Downloaded/verified artifacts (keyed by sha256)
-├── envs/         # Materialized base environments (keyed by sha256)
-├── realms/       # Active realm instances
-└── state/        # Runtime state, journals, locks
-```
-
-### Environment Spec (TOML)
-
-```toml
-[env]
-id = "node20"
-version = "1.0.0"
-description = "Node.js 20 LTS environment"
-platforms = ["macos", "linux"]
-arch = ["x86_64", "aarch64"]
-
-[base]
-kind = "prebuilt"
-artifact = "node20.tar.zst"
-sha256 = "..."
-size = 150000000
-
-[tools.node]
-version = "20.11.0"
-check = ["node --version"]
-
-[checks]
-required_bins = ["node", "npm"]
-post_check = ["node --version", "npm --version"]
-
-[policy_defaults.network]
-egress = false
-allow_hosts = []
-
-[[mounts]]
-src = "/usr/local/bin"
-dst = "/usr/local/bin"
-ro = true
-```
-
-### Materialization with CoW
-
-On macOS, `materialize()` attempts `cp -cR` for copy-on-write (clonefile). On other platforms, it falls back to copying with hardlinks where possible. The base environment is hardened to read-only, with only a writable layer exposed.
-
-### Environment Validation
-
-```rust
-use vak_sandbox_env::{check_env, load_spec};
-let spec = load_spec(&spec_path)?;
-let report = check_env(&spec, &realm_root)?;
-assert!(report.ok);
-```
-
-## Management, Heartbeat & Control Protocol
-
-### SandboxManager
-
-The `SandboxManager` orchestrates realm lifecycle:
-
-- `create_realm(req)` - Create a new realm (from env or minimal)
-- `get_realm(id)` - Retrieve realm handle
-- `list_realms()` - List all realms
-- `ping(id)` - Send heartbeat ping
-- `heartbeat_monitor()` - Access liveness monitor
-
-### HeartbeatMonitor
-
-Tracks realm health with configurable timeouts:
-
-```rust
-let monitor = mgr.heartbeat_monitor();
-mgr.ping(&realm_id).await;
-monitor.is_alive(&realm_id); // true if seen within timeout
-monitor.check_stale();       // returns stale realm IDs
-monitor.get_all();           // all heartbeats
-```
-
-Default timeout: 30 seconds. Heartbeats include timestamp, PID, load, memory usage.
-
-### Control Protocol
-
-Message-based protocol for inter-component communication:
-
-```rust
-use vak_sandbox_runtime::{ControlMessage, ControlResponse};
-
-// Messages
-ControlMessage::Ping { realm_id }
-ControlMessage::Exec { realm_id, cmd, args }
-ControlMessage::Snapshot { realm_id }
-ControlMessage::Promote { realm_id }
-ControlMessage::Destroy { realm_id }
-ControlMessage::Status { realm_id }
-
-// Responses
-ControlResponse::Pong { realm_id, alive }
-ControlResponse::ExecResult { realm_id, exit_code, stdout, stderr }
-ControlResponse::Snapshot { realm_id, manifest }
-ControlResponse::Promoted { realm_id, receipt }
-ControlResponse::Destroyed { realm_id }
-ControlResponse::Status { realm_id, status, info }
-ControlResponse::Error { message }
-```
-
-## CLI Usage (vaksb)
-
-```bash
-# Show help
-vaksb --help
-
-# Process containment (implemented on macOS)
-vaksb run --workspace /tmp/job --cwd /tmp/job --timeout-seconds 30 --max-output-bytes 32768 -- python3 -c 'print("hello")'
-
-# Environment management
-vaksb env list
-vaksb env check <spec.toml>
-
-# Durable Realms (reuse the same --store for every invocation)
-vaksb --store /private/control realm create --project /path/to/project
-vaksb --store /private/control realm list
-vaksb --store /private/control realm status <realm-id>
-vaksb --store /private/control realm exec <realm-id> --cwd . -- /bin/pwd
-vaksb --store /private/control realm snapshot <realm-id> --offset 0
-vaksb --store /private/control realm read <realm-id> file.txt --offset 0
-# Use the exact fingerprint and all paths returned by the review, in order:
-vaksb --store /private/control realm promote <realm-id> --fingerprint <sha256> --paths=file.txt
-vaksb --store /private/control realm rollback <realm-id> <transaction-id> --paths=file.txt
-# Use the exact recovery_paths from status (omit --paths when empty):
-vaksb --store /private/control realm recover <realm-id> --paths=file.txt
-vaksb --store /private/control realm destroy <realm-id>
-
-# Saved status is durable; heartbeat pings are process-local observations.
-vaksb --store /private/control status [realm-id]
-vaksb ping <realm-id>
-vaksb health
-```
-
-## API Documentation
-
-Generate and view API docs:
-
-```bash
-cargo doc --workspace --no-deps --open
-```
-
-Key types:
-- `vak_sandbox_core::{Policy, SandboxBackend, SandboxEnv, ProcessPlan, RealmPlan}`
-- `vak_sandbox_core::path::{confined, is_contained, safe_canonicalize}`
-- `vak_sandbox_env::{EnvStore, EnvSpec, materialize, check_env}`
-- `vak_sandbox_runtime::{SandboxManager, HeartbeatMonitor, ControlMessage}`
-- `vak_sandbox_seatbelt::SeatbeltBackend`
-
-## Development
-
-### Setup
-
-```bash
-git clone https://github.com/nranjan2code/sandbox.git
-cd sandbox
-cargo build --workspace
-```
-
-### Code Style
-
-- **Edition**: Rust 2024
-- **Lints**: Strict Clippy (`all`, `pedantic`, `nursery` as warnings). `unwrap`/`expect`/`panic` denied in library code
-- **Safety**: `unsafe_code = "deny"`
-- **Errors**: Use `thiserror` for error types
-- **Comments**: Explain *why* (especially security rationale), not *what*
-- **Paths**: Always go through `confined()` before use
-- **Tests**: Unit tests in modules, integration tests as needed
-
-### Adding a new backend
-
-1. Implement `SandboxBackend` trait from `vak-sandbox-core`
-2. Implement `SandboxEnv` trait for the backend's environment handles
-3. Add crate in `crates/` and add to workspace
-4. Register backend in runtime/CLI
-
-### Security Guidelines
-
-- Never interpolate untrusted paths into shell commands or config profiles
-- Always quote strings properly (use `shell_quote`/`sbpl_quote` helpers)
-- Canonicalize and validate paths before use
-- Filter environment variables strictly
-- Keep promotion journal outside the workspace being promoted
-- Use file locks for cross-process promotion operations
-
-## Testing
-
-### Run all tests
-
-```bash
-# Local (macOS)
+Runtime-independent process containment and durable project copies with reviewed promotion.
+
+**Current scope:** macOS Seatbelt, supervised commands, retained Realms, fingerprint-bound promotion, recovery and latest-promotion rollback. Linux process backends are unavailable. This is a constrained execution boundary, not a VM or a guarantee that arbitrary build systems will run unchanged.
+
+## Supported behavior
+
+| Capability | Current contract |
+| --- | --- |
+| Command authority | Explicit executable and arguments; argument paths never grant reads |
+| Filesystem | Explicit policy grants and overriding denies; CLI adds documented system runtime reads |
+| Network | Denied by default; library policies support explicit localhost ports; unsupported remote/DNS policies fail before launch |
+| Environment | Clear inherited environment; pass declared values only; reject loader-affecting variables |
+| Lifetime | Trusted native supervisor and group anchor; deny group/session changes and `posix_spawn`; verify cleanup before completion |
+| Persistent work | Runtime-owned private Realm store, separate workspace and control state |
+| Review | Deterministic unique sorted paths, exact candidate fingerprint, paged file contents |
+| Apply | Staged immutable candidates/backups, version checks, journal, per-file atomic replacement |
+| Recovery | Explicit active transaction identity and verified command cleanup; unverified cleanup quarantined, no command replay |
+| Rollback | Latest committed promotion for that Realm, exact paths, original-project version checks |
+| Resources | CLI wall/output caps and copy/manifest/count bounds; no CPU, memory, process-count or disk-growth quota |
+
+`fork` followed by `exec` is supported. `setsid`, `setpgid`, indirect syscall dispatch and `posix_spawn` are blocked. Spawn attributes can detach a process inside the Darwin kernel, so a process-group signal alone is insufficient. Some interpreter launchers, process libraries and build tools require `posix_spawn` and will fail. Do not disable the gates or run failed work on the host as an automatic fallback. See [backend compatibility](docs/backends/BACKENDS.md).
+
+## Build and verify
+
+Rust 1.90+, macOS command-line developer tools and `/usr/bin/sandbox-exec` are required for native execution. Cargo builds the small in-repo supervisor using the system C compiler and embeds it in the Seatbelt crate. No separately installed daemon or network listener is used.
+
+```sh
+cargo build --locked --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-
-# Linux (Docker)
-docker run --rm -v $(pwd):/sandbox -w /sandbox vaksb-rust:1.90 cargo test --workspace
 ```
 
-### Test coverage
+The CLI is `target/debug/vaksb`. Read [testing](docs/automation/TESTING.md) for the actual test targets, fixture behavior and limits of the evidence. A passing unit suite alone does not prove OS containment or power-loss durability.
 
-Current tests:
-- `vak-sandbox-core`: Path confinement (traversal, absolute paths, normal paths)
-- `vak-sandbox-env`: Hashing, store layout, file hashing
-- `vak-sandbox-runtime`: Realm creation, heartbeat/ping
+## One-shot process containment
 
-Run with output:
-```bash
-cargo test --workspace -- --nocapture
+Supply a specific existing project directory, separated from trusted supervisor storage. The raw CLI does not copy that directory; it grants writes there. An application requiring disposable execution must create and own its copy first.
+
+```sh
+vaksb capabilities
+vaksb run --workspace /path/to/disposable-copy --cwd /path/to/disposable-copy \
+  --timeout-seconds 30 --max-output-bytes 32768 -- /bin/sh -c 'printf ready'
 ```
 
-### Docker test images
+`capabilities` returns containment contract `2`, with supervised-process and detachment-gate declarations. It is a capability declaration, not proof that a particular command succeeded. Executing `run` always uses the supervisor; there is no unsupervised fallback.
 
-```bash
-# Build test images
-docker build -t vaksb-rust:1.90 -f Dockerfile.rust .
-docker build -t vaksb-test:alpine -f Dockerfile.test .
+System runtime read grants in `run` and the runtime executor include `/usr`, `/bin`, `/etc`, `/System`, `/Library`, `/opt` and `/dev` (canonicalized on macOS). These are broader than the selected project's files. The backend itself does not silently add those trees. Minimal bootstrap metadata, the root directory and standard null/random devices remain accessible. An explicitly selected executable outside the system roots gets a file read grant in `run`; its argument files and package ancestors do not.
+
+## Durable project work
+
+Use one private store consistently between invocations, outside the original project and every jailed copy.
+
+```sh
+vaksb --store /path/to/private/control realm create --project /path/to/project
+vaksb --store /path/to/private/control realm list
+vaksb --store /path/to/private/control realm exec REALM_ID --cwd . -- /bin/pwd
+vaksb --store /path/to/private/control realm snapshot REALM_ID --offset 0
+vaksb --store /path/to/private/control realm read REALM_ID src/file.rs --offset 0
 ```
 
-## Roadmap
+Review every page under the same fingerprint and inspect relevant complete file contents. A snapshot is a review manifest, not a restorable filesystem checkpoint. Authorize promotion with the exact fingerprint and all paths in review order. Committed receipts name the transaction needed for rollback. See the [runbook](docs/operations/RUNBOOK.md) for apply, rollback, cancellation and recovery.
 
-### Phase 1: Foundation (Complete)
-- [x] Core traits and policy system
-- [x] Path confinement with symlink protection
-- [x] macOS Seatbelt process jail backend
-- [x] Environment store with CoW materialization
-- [x] Hash verification
-- [x] Runtime manager and heartbeat monitor
-- [x] Control protocol types
-- [x] Linux stubs (Landlock/Bubblewrap)
-- [x] Basic tests on macOS and Linux
+Creation without a project produces an empty non-promotable Realm. Creation with `--env DIGEST` copies a verified environment without granting promotion into its cache. Only project-backed Realms can promote to an original project. Environment aliases and policy overrides are rejected.
 
-### Phase 2: Bounded durable Realm workflow (Implemented)
-- [x] Runtime-owned retained copies with macOS process containment
-- [x] Durable promotion transaction journal
-- [x] Recoverable promotion with durable candidates/backups
-- [x] Latest-promotion rollback with conflict refusal
-- [x] Paged change manifest and original/candidate file review
-- [x] OS file locks for operations sharing the canonical control store
+## Bounds and exclusions
 
-### Phase 3: Linux Backends (Planned)
-- [ ] Landlock LSM integration
-- [ ] seccomp-bpf syscall filtering
-- [ ] Bubblewrap (bwrap) backend
-- [ ] Resource limits via rlimits/cgroups
-- [ ] Cross-platform backend auto-detection
+- Realm command: 30 seconds and 32 KiB combined returned output.
+- Initial/retained copy scan: 512 MiB, 50,000 entries and 8 MiB manifest.
+- Retained Realms: 32; changes per promotion: 200.
+- Review page: 20 changes; file read: 16 KiB by byte offset.
+- Supported filesystem objects: regular files/directories; Realm symlinks, special files and file/directory replacement are refused.
+- Common credential filenames, `.env*`, `.git` and `.vak` are omitted from initial copies and protected from promotion. Exclusions do not inspect secret content.
 
-### Phase 4: CLI & Management (In Progress)
-- [x] One-shot macOS `vaksb run` process containment with optional cwd, workspace, wall-time and output bounds
-- [x] Environment spec checking and basic health/status command surface
-- [ ] Environment download/fetch integration points
-- [ ] Durable realm create/exec/snapshot/promote/destroy commands
-- [ ] Status dashboard and health monitoring
-- [ ] JSON output mode for programmatic use
-- [ ] Configuration file support
+Multi-file promotion is recoverable, not globally atomic to readers. Advisory locks coordinate this canonical store, not external editors or separate stores. Avoid concurrent host-project edits. Receipts/backups survive destruction and need separate retention management. Resource quotas remain incomplete.
 
-### Phase 5: Production Hardening (Planned)
-- [ ] Comprehensive integration tests
-- [ ] Audit logging system
-- [ ] Performance benchmarks
-- [ ] Security audit
-- [ ] Documentation expansion
-- [ ] Example environments and recipes
+## Public ownership boundaries
 
-## Contributing
+| Crate | Responsibility |
+| --- | --- |
+| `vak-sandbox-core` | Policy/trait schemas, checked paths, legacy low-level event journal |
+| `vak-sandbox-seatbelt` | Policy compilation, supervised process jail; direct legacy Realm creation is rejected |
+| `vak-sandbox-env` | Artifact/tree digests, bounded environment copies, static checks |
+| `vak-sandbox-runtime` | Durable Realm lifecycle, execution gate, review, transaction/recovery/rollback and audit |
+| `vak-sandbox-ctl` | Bounded CLI, signal handling and machine-readable receipts |
 
-Contributions are welcome! Please follow the guidelines in [AGENTS.md](AGENTS.md):
+Containment and promotion remain separate. `SeatbeltBackend::create_realm` does not implement the runtime's persistence or promotion; it now returns an error rather than launching a second, incomplete execution path. Use `RealmStore`/`SandboxManager`.
 
-1. Read the philosophy and rules carefully
-2. Security is paramount - never cut corners
-3. All paths must be confined
-4. Tests required for new functionality
-5. Follow Rust style and lints
-6. Explain security rationale in comments
+## Documentation
 
-## License
+Start with the [documentation index](docs/README.md), [security model](docs/security/THREAT_MODEL.md), [architecture](docs/architecture/OVERVIEW.md), [API guide](docs/api/CORE_API.md), [environment format](docs/environments/ENVIRONMENTS.md), and [upgrade notes](docs/operations/UPGRADING.md). The [hardening record](docs/security/HARDENING-2026-10-28.md) maps review findings to repairs and evidence. [CHANGELOG.md](CHANGELOG.md) records the changes.
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- Inspired by [vak/code](https://github.com/nranjan2code/code)'s transactional sandbox model
-- Inspired by [Anthropic's sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime)
-- Built for the [Vakyartha](https://github.com/nranjan2code/vakyartha) ecosystem
+MIT licensed. See [AGENTS.md](AGENTS.md) before modifying the implementation.

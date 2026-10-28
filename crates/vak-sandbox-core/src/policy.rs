@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Policy {
     pub fs: FsPolicy,
     pub network: NetworkPolicy,
@@ -10,7 +10,7 @@ pub struct Policy {
     pub resources: ResourcePolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FsPolicy {
     /// Paths allowed for reading (deny all others)
     #[serde(default)]
@@ -29,7 +29,11 @@ pub struct FsPolicy {
     pub follow_symlinks: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Independent serialized capabilities preserve the public policy schema."
+)]
 pub struct NetworkPolicy {
     /// Allow network access at all (default false)
     #[serde(default)]
@@ -60,7 +64,7 @@ pub struct NetworkPolicy {
     pub allow_dns: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EnvPolicy {
     /// Only these env vars are passed to sandboxed process
     #[serde(default)]
@@ -89,51 +93,6 @@ pub struct ResourcePolicy {
     pub max_file_size: Option<u64>,
 }
 
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            fs: FsPolicy::default(),
-            network: NetworkPolicy::default(),
-            env: EnvPolicy::default(),
-            resources: ResourcePolicy::default(),
-        }
-    }
-}
-
-impl Default for FsPolicy {
-    fn default() -> Self {
-        Self {
-            allow_read: vec![],
-            allow_write: vec![],
-            deny: vec![],
-            follow_symlinks: false,
-        }
-    }
-}
-
-impl Default for NetworkPolicy {
-    fn default() -> Self {
-        Self {
-            allow: false,
-            allow_outbound: false,
-            allow_inbound: false,
-            allow_localhost: false,
-            allow_hosts: vec![],
-            allow_ports: vec![],
-            allow_dns: false,
-        }
-    }
-}
-
-impl Default for EnvPolicy {
-    fn default() -> Self {
-        Self {
-            allow: HashSet::new(),
-            set: std::collections::HashMap::new(),
-        }
-    }
-}
-
 impl Default for ResourcePolicy {
     fn default() -> Self {
         Self {
@@ -147,21 +106,25 @@ impl Default for ResourcePolicy {
 }
 
 impl Policy {
+    #[must_use]
     pub fn deny_all() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn allow_path_read(mut self, path: PathBuf) -> Self {
         self.fs.allow_read.push(path);
         self
     }
 
+    #[must_use]
     pub fn allow_path_write(mut self, path: PathBuf) -> Self {
         self.fs.allow_write.push(path);
         self
     }
 
-    pub fn allow_network(mut self) -> Self {
+    #[must_use]
+    pub const fn allow_network(mut self) -> Self {
         self.network.allow = true;
         self.network.allow_outbound = true;
         self.network.allow_inbound = false;
@@ -169,7 +132,8 @@ impl Policy {
         self
     }
 
-    pub fn allow_network_full(mut self) -> Self {
+    #[must_use]
+    pub const fn allow_network_full(mut self) -> Self {
         self.network.allow = true;
         self.network.allow_outbound = true;
         self.network.allow_inbound = true;
@@ -178,7 +142,8 @@ impl Policy {
         self
     }
 
-    pub fn allow_network_egress(mut self) -> Self {
+    #[must_use]
+    pub const fn allow_network_egress(mut self) -> Self {
         self.network.allow = true;
         self.network.allow_outbound = true;
         self.network.allow_inbound = false;
@@ -186,6 +151,7 @@ impl Policy {
         self
     }
 
+    #[must_use]
     pub fn allow_env(mut self, key: impl Into<String>) -> Self {
         self.env.allow.insert(key.into());
         self

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,12 +20,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Machine-readable containment contract (not a runtime execution probe)
+    Capabilities,
     /// Run a command in the sandbox (OS-level process containment)
     Run {
         /// Directory in the isolated workspace where the command starts
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// The only workspace directory the command may read or write
+        /// Workspace read/write scope, separate from system runtime read grants
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Stop the process after this many seconds (1–300)
@@ -136,6 +139,10 @@ enum RealmAction {
     },
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Explicit command dispatch keeps the platform and approval boundaries visible."
+)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -152,6 +159,10 @@ async fn main() -> anyhow::Result<()> {
     let mgr = Arc::new(SandboxManager::new(store));
 
     match cli.command {
+        Commands::Capabilities => println!(
+            "{}",
+            serde_json::json!({"contract": 2, "supervised_processes": cfg!(target_os = "macos"), "detachment_denied": true, "posix_spawn": false})
+        ),
         Commands::Run {
             cwd,
             workspace,
@@ -203,8 +214,7 @@ async fn main() -> anyhow::Result<()> {
                     .allow_path_read("/opt".into())
                     .allow_path_read("/usr/local".into())
                     .allow_path_read(workspace.clone())
-                    .allow_path_write(workspace.clone())
-                    .allow_path_write("/dev".into());
+                    .allow_path_write(workspace.clone());
                 let path = if inherited {
                     std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
                 } else {
@@ -229,22 +239,10 @@ async fn main() -> anyhow::Result<()> {
                         command_env.insert(key, value);
                     }
                 }
-                if let Ok(executable) = std::fs::canonicalize(&command) {
+                if let Ok(executable) = std::fs::canonicalize(&command)
+                    && executable.is_file()
+                {
                     policy = policy.allow_path_read(executable);
-                }
-                if let Some(script) = args.first().and_then(|arg| std::fs::canonicalize(arg).ok()) {
-                    policy = policy.allow_path_read(script.clone());
-                    for ancestor in script.ancestors() {
-                        if ancestor
-                            .file_name()
-                            .is_some_and(|name| name == "node_modules")
-                        {
-                            if let Some(package_root) = ancestor.parent() {
-                                policy = policy.allow_path_read(package_root.to_path_buf());
-                            }
-                            break;
-                        }
-                    }
                 }
                 let plan = ProcessPlan {
                     command: command.clone(),
@@ -254,14 +252,14 @@ async fn main() -> anyhow::Result<()> {
                     policy,
                 };
                 let env = backend.create_process(&plan).await.unwrap_or_else(|e| {
-                    eprintln!("Failed to create sandbox: {}", e);
+                    eprintln!("Failed to create sandbox: {e}");
                     std::process::exit(1);
                 });
                 let handle = env
                     .exec(&command, &args, &HashMap::new())
                     .await
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to exec: {}", e);
+                        eprintln!("Failed to exec: {e}");
                         std::process::exit(1);
                     });
                 let deadline = async {
@@ -278,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut exit_task = tokio::spawn(async move { exit.await.unwrap_or(-1) });
                 let mut output_bytes = 0usize;
                 let mut code = -1;
+                let mut exited = false;
                 let mut stdout_done = false;
                 let mut stderr_done = false;
                 let mut timed_out = false;
@@ -286,14 +285,14 @@ async fn main() -> anyhow::Result<()> {
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
                 let mut int =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-                while !(stdout_done && stderr_done) {
+                while !(stdout_done && stderr_done && exited) {
                     tokio::select! {
-                        _ = &mut deadline => { timed_out = true; break; }
+                        () = &mut deadline => { timed_out = true; break; }
                         _ = term.recv() => { interrupted = true; break; }
                         _ = int.recv() => { interrupted = true; break; }
                         line = stdout.recv(), if !stdout_done => match line {
                             Some(line) => {
-                                output_bytes = output_bytes.saturating_add(line.len() + 1);
+                                output_bytes = output_bytes.saturating_add(line.len());
                                 if max_output_bytes.is_some_and(|max| output_bytes as u64 > max) { break; }
                                 print!("{line}");
                             }
@@ -301,20 +300,20 @@ async fn main() -> anyhow::Result<()> {
                         },
                         line = stderr.recv(), if !stderr_done => match line {
                             Some(line) => {
-                                output_bytes = output_bytes.saturating_add(line.len() + 1);
+                                output_bytes = output_bytes.saturating_add(line.len());
                                 if max_output_bytes.is_some_and(|max| output_bytes as u64 > max) { break; }
                                 eprint!("{line}");
                             }
                             None => stderr_done = true,
                         },
-                        result = &mut exit_task, if stdout_done && stderr_done => {
+                        result = &mut exit_task, if !exited => {
                             code = result.unwrap_or(-1);
-                            break;
+                            exited = true;
                         }
                     }
                 }
                 if interrupted {
-                    env.destroy().await.ok();
+                    finish_process(env.as_ref()).await;
                     std::process::exit(143);
                 }
                 if timed_out || max_output_bytes.is_some_and(|max| output_bytes as u64 > max) {
@@ -326,17 +325,22 @@ async fn main() -> anyhow::Result<()> {
                             "sandbox output limit exceeded"
                         }
                     );
-                    env.destroy().await.ok();
+                    finish_process(env.as_ref()).await;
                     std::process::exit(if timed_out { 124 } else { 125 });
                 }
-                if code == -1 {
-                    code = exit_task.await.unwrap_or(-1);
-                }
-                env.destroy().await.ok();
+                finish_process(env.as_ref()).await;
                 std::process::exit(code);
             }
             #[cfg(not(target_os = "macos"))]
             {
+                let _ = (
+                    cwd,
+                    workspace,
+                    timeout_seconds,
+                    max_output_bytes,
+                    command,
+                    args,
+                );
                 eprintln!("OS-level sandbox backend not available on this platform");
                 std::process::exit(1);
             }
@@ -344,13 +348,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Env { action } => match action {
             EnvAction::List => {
                 println!(
-                    "Environments stored in: {:?}",
-                    EnvStore::default_root().join("envs")
+                    "Environments stored in: {}",
+                    EnvStore::default_root().join("envs").display()
                 );
                 println!("(Use env specs to define environments)");
             }
             EnvAction::Check { spec } => {
-                println!("Checking spec: {}", spec);
+                println!("Checking spec: {spec}");
                 let s = vak_sandbox_env::load_spec(std::path::Path::new(&spec))?;
                 println!("✓ Loaded: {} v{}", s.env.id, s.env.version);
                 println!("  Description: {}", s.env.description);
@@ -406,16 +410,17 @@ async fn main() -> anyhow::Result<()> {
                         &realm_id,
                         serde_json::json!({"command": command, "args": args, "cwd": cwd}),
                     )?;
-                    lease.record.status = "running".into();
-                    realms.save(&lease.record)?;
-                    let result = vak_sandbox_runtime::process::execute(
-                        &lease.record.workspace,
-                        &working,
-                        command,
-                        args,
+                    realms.begin_execution(&mut lease)?;
+                    let result = vak_sandbox_runtime::process::execute_leased(
+                        &mut lease, &working, command, args,
                     )
                     .await;
-                    lease.record.status = "ready".into();
+                    lease.record.status = if result.is_ok() {
+                        "ready"
+                    } else {
+                        "cleanup_failed"
+                    }
+                    .into();
                     realms.save(&lease.record)?;
                     let result = result.map_err(|e| anyhow::anyhow!(e))?;
                     realms.audit("exec_finished", &realm_id, serde_json::json!({"exit_code": result.exit_code, "stopped": result.stopped}))?;
@@ -478,9 +483,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ping { realm_id } => {
             mgr.ping(&realm_id).await;
             if mgr.heartbeat_monitor().is_alive(&realm_id) {
-                println!("✓ Pong from {}", realm_id);
+                println!("✓ Pong from {realm_id}");
             } else {
-                println!("✓ Ping sent to {}", realm_id);
+                println!("✓ Ping sent to {realm_id}");
             }
         }
         Commands::Health => {
@@ -491,11 +496,19 @@ async fn main() -> anyhow::Result<()> {
                 .count();
             println!("Health:");
             println!("  Realms: {}", realms.len());
-            println!("  Alive: {}", alive);
+            println!("  Alive: {alive}");
         }
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn finish_process(environment: &dyn vak_sandbox_core::SandboxEnv) {
+    if let Err(error) = environment.destroy().await {
+        eprintln!("Sandbox cleanup was not verified: {error}");
+        std::process::exit(126);
+    }
 }
 
 #[cfg(test)]
