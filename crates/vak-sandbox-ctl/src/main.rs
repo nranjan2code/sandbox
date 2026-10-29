@@ -18,6 +18,17 @@ struct Cli {
     store: Option<PathBuf>,
 }
 
+fn capability_report() -> serde_json::Value {
+    let execution_available = cfg!(target_os = "macos");
+    serde_json::json!({
+        "contract": 2,
+        "execution_available": execution_available,
+        "supervised_processes": execution_available,
+        "detachment_denied": execution_available,
+        "posix_spawn_denied": execution_available,
+    })
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Machine-readable containment contract (not a runtime execution probe)
@@ -159,10 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let mgr = Arc::new(SandboxManager::new(store));
 
     match cli.command {
-        Commands::Capabilities => println!(
-            "{}",
-            serde_json::json!({"contract": 2, "supervised_processes": cfg!(target_os = "macos"), "detachment_denied": true, "posix_spawn": false})
-        ),
+        Commands::Capabilities => println!("{}", capability_report()),
         Commands::Run {
             cwd,
             workspace,
@@ -514,6 +522,17 @@ async fn finish_process(environment: &dyn vak_sandbox_core::SandboxEnv) {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn capability_report_does_not_claim_unavailable_platform_controls() {
+        let report = capability_report();
+        let expected = cfg!(target_os = "macos");
+        assert_eq!(report["execution_available"], expected);
+        assert_eq!(report["supervised_processes"], expected);
+        assert_eq!(report["detachment_denied"], expected);
+        assert_eq!(report["posix_spawn_denied"], expected);
+        assert!(report.get("posix_spawn").is_none());
+    }
 
     #[test]
     fn bounded_process_options_parse_without_treating_them_as_the_command() {

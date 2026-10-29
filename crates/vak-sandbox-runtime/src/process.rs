@@ -16,6 +16,12 @@ pub struct CommandResult {
     pub stopped: Option<String>,
 }
 
+/// Whether this build has an implemented OS process-containment backend.
+#[must_use]
+pub const fn execution_available() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// # Errors
 /// Returns backend, setup, signal-handler or verified-cleanup errors. Command failures remain in the returned receipt.
 #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]

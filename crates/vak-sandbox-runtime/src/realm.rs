@@ -441,6 +441,15 @@ impl RealmStore {
     /// # Errors
     /// Requires a ready leased Realm and durable initial completion/record writes.
     pub fn begin_execution(&self, lease: &mut RealmLease) -> Result<()> {
+        if !crate::process::execution_available() {
+            return Err(io::Error::other(
+                "OS-isolated command execution requires macOS Seatbelt; no command was run",
+            ));
+        }
+        self.begin_execution_record(lease)
+    }
+
+    fn begin_execution_record(&self, lease: &mut RealmLease) -> Result<()> {
         self.ensure_ready(&lease.record)?;
         atomic_json(
             &lease.completion_path,
@@ -1368,13 +1377,26 @@ mod history_tests {
         );
         assert_eq!(lease.record.status, "ready");
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_execution_does_not_poison_realm_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RealmStore::open(temp.path()).unwrap();
+        let record = store.create(None).unwrap();
+        let mut lease = store.lease(&record.realm_id).unwrap();
+
+        assert!(!crate::process::execution_available());
+        assert!(store.begin_execution(&mut lease).is_err());
+        assert_eq!(lease.record.status, "ready");
+        store.ensure_ready(&lease.record).unwrap();
+    }
     #[test]
     fn unverified_cleanup_stays_quarantined_and_shared_gate_blocks_other_operations() {
         let temp = tempfile::tempdir().unwrap();
         let store = RealmStore::open(temp.path()).unwrap();
         let record = store.create(None).unwrap();
         let mut lease = store.lease(&record.realm_id).unwrap();
-        store.begin_execution(&mut lease).unwrap();
+        store.begin_execution_record(&mut lease).unwrap();
         let path = lease.execution_lock().unwrap();
         let supervisor = File::open(path).unwrap();
         supervisor.lock_shared().unwrap();
@@ -1438,7 +1460,7 @@ mod history_tests {
         let store = RealmStore::open(t.path()).unwrap();
         let r = store.create(None).unwrap();
         let mut lease = store.lease(&r.realm_id).unwrap();
-        store.begin_execution(&mut lease).unwrap();
+        store.begin_execution_record(&mut lease).unwrap();
         atomic_json(
             &lease.completion_path,
             &vak_sandbox_core::backend::ProcessCompletion {
