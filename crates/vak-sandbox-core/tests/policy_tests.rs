@@ -12,6 +12,7 @@ mod tests {
         assert_eq!(p.fs.allow_read, Vec::<std::path::PathBuf>::new());
         assert_eq!(p.fs.allow_write, Vec::<std::path::PathBuf>::new());
         assert!(p.env.allow.is_empty());
+        assert!(!p.resources.has_requested_limits());
     }
 
     #[test]

@@ -33,6 +33,10 @@ Astra reviewed the native descriptor/lock/reaping paths without modifying files.
 - Harden the legacy low-level journal with ID/ownership validation, writer exclusion, unique transaction naming, sync and corruption refusal. It still is not a replacement promoter.
 - Fix lint-group priority, distinguish permitted test assertions from library panic/unwrap restrictions, add public error contracts, and keep strict Clippy as a completion gate.
 
+## Explicit unsupported resource limits — 2026-10-30
+
+`ResourcePolicy::default()` previously supplied numeric CPU, memory, wall-time, process-count and file-size values even though neither OS backend enforced them. Defaults now represent no requested backend quota. macOS and Linux refuse any explicit `ResourcePolicy` request before target execution until each requested limit has real enforcement semantics. The CLI/runtime wall and output ceilings are separate controls and are not reported as aggregate CPU/memory guarantees. macOS policy tests and Linux Rust 1.99.1 Docker tests include a pre-effect refusal canary. Linux Docker has a read-only cgroup v2 mount, so it cannot support or verify a future cgroup quota backend in this gate. One parallel macOS policy-suite run also had the existing localhost networking test fail with an unverified supervisor completion; its isolated rerun passed. Keep that failure in the evidence; the cause is unknown.
+
 ## Retained failure evidence and interpretation
 
 The baseline had 19 discovered passing tests, 18 undiscovered tests, no Seatbelt tests and a failing strict Clippy gate. Synthetic probes demonstrated outside reads, a one-second deadline returning success after a longer closed-stream command, a late detached writer after a ready receipt, and normal repeated-state recovery failure.

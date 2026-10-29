@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::{collections::HashMap, fs, path::Path};
-use vak_sandbox_core::{Policy, ProcessPlan, RealmPlan, SandboxBackend};
+use vak_sandbox_core::{Error, Policy, ProcessPlan, RealmPlan, SandboxBackend};
 use vak_sandbox_seatbelt::SeatbeltBackend;
 fn system_policy() -> Policy {
     [
@@ -101,6 +101,27 @@ async fn quotes_in_paths_are_data_and_unavailable_allow_roots_are_not_silently_i
     };
     assert!(SeatbeltBackend.create_process(&plan).await.is_err());
 }
+
+#[tokio::test]
+async fn requested_resource_limits_refuse_before_execution() {
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("should-not-exist");
+    let mut policy = system_policy();
+    policy.resources.max_memory_bytes = Some(64 * 1024 * 1024);
+    let plan = ProcessPlan {
+        command: "/usr/bin/touch".into(),
+        args: vec![marker.display().to_string()],
+        cwd: Some(work.path().into()),
+        env: HashMap::new(),
+        policy,
+    };
+    assert!(matches!(
+        SeatbeltBackend.create_process(&plan).await,
+        Err(Error::InvalidPolicy(message)) if message.contains("resource limits are not enforced")
+    ));
+    assert!(!marker.exists());
+}
+
 #[tokio::test]
 async fn enabled_network_is_limited_to_selected_localhost_ports() {
     let work = tempfile::tempdir().unwrap();

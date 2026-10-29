@@ -14,6 +14,15 @@ mod macos {
         SandboxEnv, SandboxMode,
     };
 
+    fn validate_resource_policy(policy: &vak_sandbox_core::ResourcePolicy) -> Result<()> {
+        if policy.has_requested_limits() {
+            return Err(Error::InvalidPolicy(
+                "macOS resource limits are not enforced by this backend; no command was run".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn sbpl_quote(value: &str) -> String {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     }
@@ -204,6 +213,7 @@ mod macos {
             let completion = completion.map(Path::to_path_buf);
             let plan = plan.clone();
             Box::pin(async move {
+                validate_resource_policy(&plan.policy.resources)?;
                 let profile = profile(&plan.policy)?;
                 for (key, value) in plan.policy.env.set.iter().chain(
                     plan.env

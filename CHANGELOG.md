@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Add a first-party Linux Landlock/seccomp supervisor with bounded command execution, explicit filesystem grants, complete network denial, process-group cleanup, cancellation and verified Realm receipts. Require Landlock ABI 5+ so device ioctls are denied by policy; unsupported kernels and policy shapes fail before launch.
 - Update Linux capability reporting and CLI execution to reflect actual kernel support. Correct the former Linux-always-unavailable test to verify contained execution when supported and fail-closed refusal otherwise.
+- Make unsupported CPU, memory, wall-time, process-count and file-size policy limits default to unrequested, and refuse explicit requests before process launch on both OS backends. The separately enforced CLI wall/output ceilings remain distinct.
 
 ### Security and correctness hardening (2026-10-28)
 

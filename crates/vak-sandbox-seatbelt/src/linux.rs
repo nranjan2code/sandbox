@@ -105,6 +105,15 @@ fn validate_environment(plan: &ProcessPlan) -> Result<HashMap<String, String>> {
     Ok(environment)
 }
 
+fn validate_resource_policy(policy: &vak_sandbox_core::ResourcePolicy) -> Result<()> {
+    if policy.has_requested_limits() {
+        return Err(Error::InvalidPolicy(
+            "Linux resource limits are not enforced by this backend; no command was run".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -174,6 +183,7 @@ impl LandlockBackend {
                         .into(),
                 ));
             }
+            validate_resource_policy(&plan.policy.resources)?;
             if plan.command.is_empty()
                 || plan.command.len() > MAX_COMMAND_BYTES
                 || plan.command.contains('\0')
@@ -591,6 +601,31 @@ mod tests {
             policy,
         };
         assert!(LandlockBackend.create_process(&plan).await.is_err());
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn requested_resource_limits_refuse_before_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("should-not-exist");
+        let mut policy = policy(workspace.path());
+        policy.resources.max_memory_bytes = Some(64 * 1024 * 1024);
+        let plan = ProcessPlan {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("touch {}", marker.display())],
+            cwd: Some(workspace.path().into()),
+            env: HashMap::new(),
+            policy,
+        };
+        let result = LandlockBackend.create_process(&plan).await;
+        if !LandlockBackend.available() {
+            assert!(result.is_err());
+            assert!(!marker.exists());
+            return;
+        }
+        assert!(
+            matches!(result, Err(Error::InvalidPolicy(message)) if message.contains("resource limits are not enforced"))
+        );
         assert!(!marker.exists());
     }
 

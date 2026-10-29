@@ -15,7 +15,7 @@ vaksb --store /path/to/control realm status REALM_ID
 vaksb --store /path/to/control realm exec REALM_ID --cwd . -- /bin/sh -c 'printf ready > proof.txt'
 ```
 
-Commands receive a minimal PATH/HOME/TMPDIR policy, network denial and explicit system read grants. There is no implicit shell. A command's first argument never grants reads. Fork/exec works; group/session detachment, Linux namespace operations and macOS `posix_spawn` are blocked. Some interpreter wrappers or build tools will fail. Explain that restriction; do not run on the host or disable the gates automatically.
+Commands receive a minimal PATH/HOME/TMPDIR policy, network denial and explicit system read grants. There is no implicit shell. A command's first argument never grants reads. Fork/exec works; group/session detachment, Linux namespace operations and macOS `posix_spawn` are blocked. Some interpreter wrappers or build tools will fail. Explain that restriction; do not run on the host or disable the gates automatically. Neither OS backend currently enforces the serialized CPU, memory, wall-time, process-count or file-size `ResourcePolicy`; default policies request no such limits, and explicit requests are rejected before target launch. The CLI's own wall/output ceilings are separate controls, not aggregate CPU or memory quotas.
 
 ## Review every changed path
 
@@ -77,7 +77,7 @@ Destroy removes the isolated copy/record after pending checks. Receipts/backups 
 | invalid policy | Unsupported authority request; no automatic weakening/retry |
 | conflict / stale review | Re-review current state; do not reuse old authorization arguments |
 
-The runtime distinguishes an ordinary target exit 126 from unverified cleanup using the private completion receipt. The raw CLI also uses 126 for supervisor failure, so callers must not infer verified success from a nonzero raw exit alone. The CLI/runtime keep deadlines active even with closed streams. Owner death transfers cleanup responsibility to the native supervisors; a shared execution gate blocks new Realm operations until cleanup releases it. No CPU, memory, process-count or disk-growth quotas exist.
+The runtime distinguishes an ordinary target exit 126 from unverified cleanup using the private completion receipt. The raw CLI also uses 126 for supervisor failure, so callers must not infer verified success from a nonzero raw exit alone. The CLI/runtime keep deadlines active even with closed streams. Owner death transfers cleanup responsibility to the native supervisors; a shared execution gate blocks new Realm operations until cleanup releases it. No CPU, memory, process-count or disk-growth quotas exist. If a caller requests any currently unsupported `ResourcePolicy` limit, the backend refuses before launching the command.
 
 ## Limits
 

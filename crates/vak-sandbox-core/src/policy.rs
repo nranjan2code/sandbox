@@ -75,7 +75,7 @@ pub struct EnvPolicy {
     pub set: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourcePolicy {
     /// Max CPU time in seconds (None = unlimited)
     pub max_cpu_seconds: Option<u64>,
@@ -93,15 +93,15 @@ pub struct ResourcePolicy {
     pub max_file_size: Option<u64>,
 }
 
-impl Default for ResourcePolicy {
-    fn default() -> Self {
-        Self {
-            max_cpu_seconds: Some(3600),
-            max_memory_bytes: Some(2 * 1024 * 1024 * 1024), // 2GB
-            max_wall_seconds: Some(7200),
-            max_processes: Some(256),
-            max_file_size: Some(1024 * 1024 * 1024), // 1GB
-        }
+impl ResourcePolicy {
+    /// True when a caller asks the backend to enforce at least one resource limit.
+    #[must_use]
+    pub const fn has_requested_limits(&self) -> bool {
+        self.max_cpu_seconds.is_some()
+            || self.max_memory_bytes.is_some()
+            || self.max_wall_seconds.is_some()
+            || self.max_processes.is_some()
+            || self.max_file_size.is_some()
     }
 }
 

@@ -19,7 +19,7 @@ Runtime-independent process containment and durable project copies with reviewed
 | Apply | Staged immutable candidates/backups, version checks, journal, per-file atomic replacement |
 | Recovery | Explicit active transaction identity and verified command cleanup; unverified cleanup quarantined, no command replay |
 | Rollback | Latest committed promotion for that Realm, exact paths, original-project version checks |
-| Resources | CLI wall/output caps and copy/manifest/count bounds; no CPU, memory, process-count or disk-growth quota |
+| Resources | CLI wall/output caps and copy/manifest/count bounds; no CPU, memory, process-count or disk-growth quota. Explicit backend resource requests fail before launch. |
 
 `fork` followed by `exec` is supported on both backends. macOS blocks `setsid`, `setpgid`, indirect syscall dispatch and `posix_spawn`. Linux drops the target's inherited capabilities and blocks session/group changes, mount and namespace operations, network syscalls, and attempts to signal processes outside the contained process group or its trusted supervisor. Some process libraries and build tools remain incompatible. Do not disable the gates or run failed work on the host as an automatic fallback. See [backend compatibility](docs/backends/BACKENDS.md).
 
@@ -75,7 +75,7 @@ Creation without a project produces an empty non-promotable Realm. Creation with
 - Supported filesystem objects: regular files/directories; Realm symlinks, special files and file/directory replacement are refused.
 - Common credential filenames, `.env*`, `.git` and `.vak` are omitted from initial copies and protected from promotion. Exclusions do not inspect secret content.
 
-Multi-file promotion is recoverable, not globally atomic to readers. Advisory locks coordinate this canonical store, not external editors or separate stores. Avoid concurrent host-project edits. Receipts/backups survive destruction and need separate retention management. Resource quotas remain incomplete.
+Multi-file promotion is recoverable, not globally atomic to readers. Advisory locks coordinate this canonical store, not external editors or separate stores. Avoid concurrent host-project edits. Receipts/backups survive destruction and need separate retention management. Resource quotas remain incomplete. `ResourcePolicy::default()` requests no unsupported quota; explicit CPU, memory, wall-time, process-count or file-size limits are refused by the current OS backends rather than silently ignored. The CLI/runtime's separate wall/output bounds remain in effect on their own paths.
 
 ## Public ownership boundaries
 
