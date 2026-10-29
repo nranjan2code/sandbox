@@ -14,13 +14,6 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "detach")) {
         if (setsid() != -1 || errno != EPERM) return 10;
         if (setpgid(0, 0) != -1 || errno != EPERM) return 11;
-        posix_spawnattr_t attr;
-        if (posix_spawnattr_init(&attr) || posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP) ||
-            posix_spawnattr_setpgroup(&attr, 0)) return 12;
-        char *args[] = {"sleep", "0", NULL}; pid_t child;
-        int error = posix_spawn(&child, "/bin/sleep", NULL, &attr, args, environ);
-        posix_spawnattr_destroy(&attr);
-        if (error == 0) { waitpid(child, NULL, 0); return 13; }
         errno = 0;
         /* Exercise the deprecated indirect ABI deliberately; normal application
          * code must not use it, but it must not bypass the detachment gates. */

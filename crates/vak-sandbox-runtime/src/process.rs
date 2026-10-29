@@ -81,9 +81,51 @@ async fn execute_inner(
     ] {
         policy = policy.allow_path_read(root.into());
     }
+    let mut path_entries = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        "/usr/sbin".to_string(),
+        "/sbin".to_string(),
+    ];
+
+    // Discover user toolchain directories (e.g. .local/bin, .cargo/bin, .nvm) from host environment
+    if let Ok(host_path) = std::env::var("PATH") {
+        for entry in std::env::split_paths(&host_path) {
+            if entry.is_dir() {
+                let s = entry.to_string_lossy();
+                if s.contains(".local/bin")
+                    || s.contains(".cargo/bin")
+                    || s.contains(".nvm")
+                    || s.contains(".pyenv")
+                    || s.contains("homebrew")
+                {
+                    policy = policy.allow_path_read(entry.clone());
+                    let p_str = entry.display().to_string();
+                    if !path_entries.contains(&p_str) {
+                        path_entries.insert(0, p_str);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(user_home) = std::env::var("HOME") {
+        for sub in [".local/bin", ".cargo/bin"] {
+            let p = Path::new(&user_home).join(sub);
+            if p.is_dir() {
+                policy = policy.allow_path_read(p.clone());
+                let p_str = p.display().to_string();
+                if !path_entries.contains(&p_str) {
+                    path_entries.insert(0, p_str);
+                }
+            }
+        }
+    }
+
     policy.env.set.insert(
         "PATH".into(),
-        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        path_entries.join(":"),
     );
     policy
         .env

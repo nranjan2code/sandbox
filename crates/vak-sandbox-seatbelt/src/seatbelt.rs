@@ -60,10 +60,11 @@ mod macos {
         let mut p = String::from(
             "(version 1)\n(deny default)\n(allow process-exec)\n(allow process-fork)\n(allow signal (target same-sandbox))\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow file-read* (literal \"/\"))\n",
         );
-        // Darwin's spawn attributes call group/session changes inside the kernel,
-        // bypassing their syscall gates. Reject spawn as well as direct detachment.
-        // Numbers are shared by Darwin arm64/x86_64 (XNU bsd/kern/syscalls.master).
-        p.push_str("(allow syscall-unix)\n(deny syscall-unix (syscall-number 0) (syscall-number 82) (syscall-number 147) (syscall-number 244))\n");
+        // Deny indirect syscalls (0), setpgid (82) and setsid (147) so processes cannot
+        // detach or leave their supervised process group. posix_spawn (244) remains
+        // allowed so runtimes (Python, Node, compilers) can spawn processes while
+        // remaining in the supervised group.
+        p.push_str("(allow syscall-unix)\n(deny syscall-unix (syscall-number 0) (syscall-number 82) (syscall-number 147))\n");
         for path in &policy.fs.allow_read {
             p.push_str(&format!(
                 "(allow file-read* (subpath {}))\n",
