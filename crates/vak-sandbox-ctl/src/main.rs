@@ -19,14 +19,33 @@ struct Cli {
 }
 
 fn capability_report() -> serde_json::Value {
-    let execution_available = cfg!(target_os = "macos");
+    let execution_available = vak_sandbox_runtime::process::execution_available();
     serde_json::json!({
         "contract": 2,
         "execution_available": execution_available,
         "supervised_processes": execution_available,
         "detachment_denied": execution_available,
-        "posix_spawn_denied": execution_available,
+        "posix_spawn_denied": cfg!(target_os = "macos") && execution_available,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_workspace(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let workspace = std::fs::canonicalize(path)?;
+    if !workspace.is_dir() {
+        anyhow::bail!("workspace must be an existing directory");
+    }
+    let system_roots = [
+        "/", "/home", "/root", "/usr", "/bin", "/sbin", "/etc", "/lib", "/lib64", "/opt", "/var",
+        "/var/tmp", "/boot", "/mnt", "/media", "/proc", "/sys", "/dev", "/run", "/tmp",
+    ];
+    if system_roots
+        .iter()
+        .any(|root| workspace == PathBuf::from(root))
+    {
+        anyhow::bail!("workspace must be a specific project directory, not a system root");
+    }
+    Ok(workspace)
 }
 
 #[derive(Subcommand)]
@@ -339,7 +358,38 @@ async fn main() -> anyhow::Result<()> {
                 finish_process(env.as_ref()).await;
                 std::process::exit(code);
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            {
+                let inherited = std::env::var("VAK_SANDBOX").as_deref() == Ok("1");
+                let selected =
+                    workspace.or_else(|| inherited.then(|| std::env::current_dir().ok()).flatten());
+                let Some(workspace) = selected else {
+                    anyhow::bail!("Select a specific --workspace directory for Linux execution");
+                };
+                let workspace = validate_linux_workspace(workspace)?;
+                let cwd = cwd.unwrap_or_else(|| workspace.clone());
+                let cwd = std::fs::canonicalize(cwd)?;
+                if !cwd.starts_with(&workspace) {
+                    anyhow::bail!("working directory must be inside the sandbox workspace");
+                }
+                let result = vak_sandbox_runtime::process::execute_configured(
+                    &workspace,
+                    &cwd,
+                    &command,
+                    &args,
+                    timeout_seconds,
+                    Some(usize::try_from(max_output_bytes.unwrap_or(256 * 1024))?),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+                print!("{}", result.stdout);
+                eprint!("{}", result.stderr);
+                if let Some(stopped) = result.stopped {
+                    eprintln!("sandbox execution stopped: {stopped}");
+                }
+                std::process::exit(result.exit_code);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = (
                     cwd,
@@ -526,11 +576,22 @@ mod cli_tests {
     #[test]
     fn capability_report_does_not_claim_unavailable_platform_controls() {
         let report = capability_report();
-        let expected = cfg!(target_os = "macos");
-        assert_eq!(report["execution_available"], expected);
-        assert_eq!(report["supervised_processes"], expected);
-        assert_eq!(report["detachment_denied"], expected);
-        assert_eq!(report["posix_spawn_denied"], expected);
+        let available = report["execution_available"].as_bool().unwrap();
+        assert_eq!(report["supervised_processes"], available);
+        assert_eq!(report["detachment_denied"], available);
+        assert_eq!(
+            report["posix_spawn_denied"],
+            cfg!(target_os = "macos") && available
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            available,
+            vak_sandbox_runtime::process::execution_available()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(available);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(!available);
         assert!(report.get("posix_spawn").is_none());
     }
 
@@ -567,5 +628,21 @@ mod cli_tests {
         ] {
             assert!(Cli::try_parse_from(["vaksb", "run", flag, value, "--", "/bin/echo"]).is_err());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_workspace_requires_specific_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            validate_linux_workspace(temp.path().to_path_buf()).unwrap(),
+            temp.path()
+        );
+        assert!(validate_linux_workspace(PathBuf::from("/home")).is_err());
+        assert!(validate_linux_workspace(PathBuf::from("/tmp")).is_err());
+        assert!(validate_linux_workspace(PathBuf::from("/var/tmp")).is_err());
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(validate_linux_workspace(file).is_err());
     }
 }

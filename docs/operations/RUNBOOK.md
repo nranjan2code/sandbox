@@ -2,7 +2,7 @@
 
 ## Build and choose storage
 
-Build with `cargo build --locked --workspace`. On macOS the system C compiler builds the embedded supervisor. Check `vaksb capabilities`: contract 2 advertises supervised process lifetime and detachment gates. A declaration is not a command test. Use a specific workspace; grants covering trusted `/private/tmp` supervisor storage are rejected. The raw `run` command does not create a disposable copy.
+Build with `cargo build --locked --workspace`. The system C compiler builds the embedded platform supervisor. Check `vaksb capabilities`: contract 2 advertises supervised process lifetime and detachment gates only when the platform backend is available. Linux requires Landlock ABI 5+ and seccomp and refuses all network access. A declaration is not a command test. Use a specific workspace; grants covering trusted supervisor storage are rejected. The raw `run` command does not create a disposable copy.
 
 Use one private canonical `--store` outside the original project and every jailed copy. Do not place control state in a directory writable by the command. Do not use separate stores to coordinate edits to the same project.
 
@@ -15,7 +15,7 @@ vaksb --store /path/to/control realm status REALM_ID
 vaksb --store /path/to/control realm exec REALM_ID --cwd . -- /bin/sh -c 'printf ready > proof.txt'
 ```
 
-Commands receive a minimal PATH/HOME/TMPDIR policy, network denial and explicit system read grants. There is no implicit shell. A command's first argument never grants reads. Fork/exec works; group/session detachment, indirect dispatch and `posix_spawn` are blocked. Some interpreter wrappers or build tools will fail. Explain that restriction; do not run on the host or disable the gates automatically.
+Commands receive a minimal PATH/HOME/TMPDIR policy, network denial and explicit system read grants. There is no implicit shell. A command's first argument never grants reads. Fork/exec works; group/session detachment, Linux namespace operations and macOS `posix_spawn` are blocked. Some interpreter wrappers or build tools will fail. Explain that restriction; do not run on the host or disable the gates automatically.
 
 ## Review every changed path
 
@@ -81,4 +81,4 @@ The runtime distinguishes an ordinary target exit 126 from unverified cleanup us
 
 ## Limits
 
-Realm command 30 s / 32 KiB output; copy 512 MiB / 50,000 entries / 8 MiB manifest; 32 retained Realms; 200 changes per promotion; 20 changes and 16 KiB file text per page. Regular files/directories only. Common credential filenames are excluded, not secret contents. Linux execution is unavailable. Heartbeats are process-local observations, not an independent persistent service health monitor.
+Realm command 30 s / 32 KiB output; copy 512 MiB / 50,000 entries / 8 MiB manifest; 32 retained Realms; 200 changes per promotion; 20 changes and 16 KiB file text per page. Regular files/directories only. Common credential filenames are excluded, not secret contents. Linux requires Landlock ABI 5+ and seccomp; it does not enforce CPU, memory, process-count or disk-growth quotas. Heartbeats are process-local observations, not an independent persistent service health monitor.

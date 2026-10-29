@@ -4,13 +4,13 @@ This hardening changes behavior intentionally. Rebuild the sandbox helper and te
 
 ## Client contract
 
-`vaksb capabilities` returns JSON with `contract: 2`, `execution_available`, `supervised_processes`, `detachment_denied` and `posix_spawn_denied`. These enforcement flags are true only in a macOS build with the Seatbelt supervisor. Unsupported platforms report false and refuse command execution before launch. Check the contract and actual platform rather than version/help strings alone. The existing executable/argument, `run`, Realm CLI and receipt shapes remain, with one additional Realm control-record field: `active_transaction`.
+`vaksb capabilities` returns JSON with `contract: 2`, `execution_available`, `supervised_processes`, `detachment_denied` and `posix_spawn_denied`. macOS uses the Seatbelt supervisor. Linux reports execution only when Landlock ABI 5+ and seccomp are available; Linux denies network access and rejects unsupported policy shapes. Other unsupported platforms report false and refuse before launch. Check the contract and actual platform rather than version/help strings alone. The executable/argument, `run`, Realm CLI and receipt shapes remain, with one additional Realm control-record field: `active_transaction`.
 
 No argument-derived read grants remain. Callers that previously depended on a script/package argument outside the workspace must stage their approved code in the workspace or provide an explicit trusted read policy through the library. Do not infer package roots from argument paths. System runtime roots remain explicit read grants, not private-project data guarantees.
 
 ## Execution restrictions
 
-The supervisor preserves ordinary fork/exec but denies direct session/group changes, indirect dispatch and all `posix_spawn`. Some language launchers/process libraries fail instead of falling back to fork/exec. This is a declared compatibility limit; do not silently disable containment. Target loader-affecting environment variables are rejected before the trusted supervisor starts.
+The supervisor preserves ordinary fork/exec. macOS denies direct session/group changes, indirect dispatch and all `posix_spawn`; Linux denies session/group/namespace changes, network syscalls and cross-process signal routes. Some language launchers/process libraries fail instead of falling back to a less restricted path. This is a declared compatibility limit; do not silently disable containment. Target loader-affecting environment variables are rejected before the trusted supervisor starts.
 
 Supervisor code lives outside target-controlled TMPDIR under a fresh private `/private/tmp` directory. A write policy spanning that trusted storage is invalid. Choose a project subdirectory instead of all `/tmp`, `/private/tmp` or `/`. Do not use the former broad default as a workspace.
 

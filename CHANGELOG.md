@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Linux Landlock and Bubblewrap placeholders now report unavailable; binary presence cannot imply process containment without an implemented and verified policy backend. The runtime compiles on Linux and refuses execution before command launch. Latest Rust diagnostics in the affected tests are also corrected.
+- Add a first-party Linux Landlock/seccomp supervisor with bounded command execution, explicit filesystem grants, complete network denial, process-group cleanup, cancellation and verified Realm receipts. Require Landlock ABI 5+ so device ioctls are denied by policy; unsupported kernels and policy shapes fail before launch.
+- Update Linux capability reporting and CLI execution to reflect actual kernel support. Correct the former Linux-always-unavailable test to verify contained execution when supported and fail-closed refusal otherwise.
 
 ### Security and correctness hardening (2026-10-28)
 

@@ -1,4 +1,4 @@
-# Sandbox handover — 2026-10-29
+# Sandbox handover — 2026-10-30
 
 The hardening is implemented in this repository only. Read the [current contract](../README.md), [agent rules](../AGENTS.md), [changelog](../CHANGELOG.md), [repair evidence](security/HARDENING-2026-10-28.md) and [upgrade notes](operations/UPGRADING.md) before further changes.
 
@@ -10,10 +10,10 @@ The hardening is implemented in this repository only. Read the [current contract
 - Promotion/rollback use explicit active transaction identity, unique sorted path reviews, synced staging and directory-aware permission ordering. Repeated content states and empty/environment recovery are covered.
 - Verified environment copies cannot promote into the environment cache. Environment checking is static; no spec-owned host commands run.
 - All 18 former orphan tests are owned by Cargo packages. Final local workspace suite: 57 passing tests; strict Clippy, format and locked build passed on macOS 27.0 arm64 / Rust 1.98.1.
-- Linux runtime compiles on Rust 1.99.1 and explicitly refuses command execution before launch or writing an unverified Realm receipt. Capability output reports platform enforcement flags accurately; Landlock and Bubblewrap stubs report unavailable even if `bwrap` is installed. Docker ARM64 workspace suite passes 51/51 and strict Clippy passes. This is compile/fail-closed evidence only; Linux containment is still unavailable.
+- Linux now has an in-repo Landlock/seccomp supervisor. It requires Landlock ABI 5+ and seccomp; applies explicit filesystem grants with device-ioctl restrictions, denies network/session changes/namespaces and cross-process signals, cleans descendants, and verifies completion before releasing Realm gates. Policies it cannot enforce fail before target launch. Bubblewrap is not used. Docker Linux 7.0.14 ARM64 on Rust 1.99.1 passes all 58 discovered workspace tests, strict Clippy, locked CLI build and CLI canaries: workspace writes succeed, outside-workspace and `/etc` writes fail, `/etc/passwd` reads are denied, network is blocked, cancellation/descendant cleanup are verified, and oversized arguments are refused before execution. macOS ARM64 on Rust 1.99.1 passes all 58 workspace tests, strict Clippy and format check. This evidence does not cover every Linux kernel, architecture or hostile same-user host process. Linux resource quotas remain unavailable.
 
 ## Preserved limits and next work
 
-Linux isolation, CPU/memory/process-count/disk-growth quotas, remote/DNS network brokerage, unmodified spawn-based toolchains and globally atomic multi-file promotion are not implemented. Power-loss behavior was not physically fault-tested. Receipt/backups/temp-code retention remains manual. External host editors and separate stores do not participate in project locks.
+CPU/memory/process-count/disk-growth quotas, remote/DNS network brokerage, unmodified syscall-restricted toolchains and globally atomic multi-file promotion are not implemented. Power-loss behavior was not physically fault-tested. Receipt/backups/temp-code retention remains manual. External host editors and separate stores do not participate in project locks.
 
 Legacy ambiguous interrupted stores require explicit inspection; do not reconstruct identity from content equality or remove lock files. A pushed sandbox commit is not an installed-helper/client migration. No client repository is part of this delivery; coordinate that work separately.

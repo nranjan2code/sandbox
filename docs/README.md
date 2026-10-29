@@ -19,4 +19,4 @@ These documents describe the implemented contract. Planned backends or policies 
 | [Testing](automation/TESTING.md) | Discovered targets, real OS checks, CI and evidence limits |
 | [Changelog](../CHANGELOG.md) | Historical changes and compatibility notes |
 
-A manifest snapshot is a review record. It is not a filesystem restore point. A receipt proves an operation's observed result, not the correctness of the code or data involved. macOS containment tests must run on macOS; Linux compilation and copy tests do not prove Linux process isolation.
+A manifest snapshot is a review record. It is not a filesystem restore point. A receipt proves an operation's observed result, not the correctness of the code or data involved. macOS containment tests must run on macOS. Linux enforcement tests exercise Landlock and seccomp in the reported Docker kernel; they do not prove containment on every kernel, architecture or host configuration.

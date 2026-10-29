@@ -1378,17 +1378,31 @@ mod history_tests {
         assert_eq!(lease.record.status, "ready");
     }
     #[cfg(target_os = "linux")]
-    #[test]
-    fn unsupported_execution_does_not_poison_realm_state() {
+    #[tokio::test]
+    async fn linux_execution_is_enforced_or_refuses_without_poisoning_state() {
         let temp = tempfile::tempdir().unwrap();
         let store = RealmStore::open(temp.path()).unwrap();
         let record = store.create(None).unwrap();
         let mut lease = store.lease(&record.realm_id).unwrap();
 
-        assert!(!crate::process::execution_available());
-        assert!(store.begin_execution(&mut lease).is_err());
-        assert_eq!(lease.record.status, "ready");
-        store.ensure_ready(&lease.record).unwrap();
+        if !crate::process::execution_available() {
+            assert!(store.begin_execution(&mut lease).is_err());
+            assert_eq!(lease.record.status, "ready");
+            store.ensure_ready(&lease.record).unwrap();
+            return;
+        }
+
+        store.begin_execution(&mut lease).unwrap();
+        let cwd = lease.record.workspace.clone();
+        let args = vec!["-c".into(), "printf realm-ready".into()];
+        let result = crate::process::execute_leased(&mut lease, &cwd, "/bin/sh", &args)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "realm-ready");
+        let receipt: vak_sandbox_core::backend::ProcessCompletion =
+            read_json(lease.execution_receipt()).unwrap();
+        assert!(receipt.verified());
     }
     #[test]
     fn unverified_cleanup_stays_quarantined_and_shared_gate_blocks_other_operations() {

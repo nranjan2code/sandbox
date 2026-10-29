@@ -26,7 +26,7 @@ The workspace root is virtual. A root-level `tests/` directory is not automatica
 | CLI unit / `tests/containment.rs` | Actual macOS executable/argument boundary, closed-stream timeout, group lifetime, owner death, explicit shell semantics, environment filtering |
 | Seatbelt `tests/policy.rs` | Actual deny-over-allow/future denies, quoted paths, permitted/denied localhost ports, unsupported policies and legacy API rejection, trusted storage/loader safeguards |
 
-macOS-only tests use platform cfg guards; a zero-test target on Linux is not a containment pass. Run `cargo test --workspace -- --list` to inspect discovery rather than relying on a badge.
+macOS-only tests use platform cfg guards; a zero-test target on Linux is not a macOS containment pass. Linux supervisor tests require Landlock ABI 5+ and seccomp and exercise actual kernel rules; on unsupported kernels they verify refusal before effects. Record kernel and architecture with the result. Run `cargo test --workspace -- --list` to inspect discovery rather than relying on a badge.
 
 ## Real process fixtures
 
@@ -44,6 +44,6 @@ Native execution-gate tests must demonstrate that another operation cannot acqui
 
 ## Evidence boundaries
 
-The hardening run was exercised on macOS 27.0 arm64. This is not evidence for every macOS/toolchain, Linux process containment, arbitrary spawn-based runtimes, power-cut durability, kernel/service escape resistance or resource exhaustion. OS/architecture upgrades should rerun native policy and lifetime tests.
+The hardening run was exercised on macOS 27.0 arm64 and Linux 7.0.14 ARM64 in Docker. These runs are not evidence for every macOS/Linux kernel or architecture, arbitrary syscall-dependent runtimes, power-cut durability, kernel/service escape resistance or resource exhaustion. OS/architecture upgrades should rerun native policy and lifetime tests.
 
 Semantic correctness of generated code or model outputs is outside these receipts. A successful command, safe rejection, committed patch or pushed repository does not substitute for the original user outcome. Preserve failed evidence while repairing tests/implementation and do not relax assertions to make a failed gate pass.

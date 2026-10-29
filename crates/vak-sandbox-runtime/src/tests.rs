@@ -47,7 +47,7 @@ mod linux_contract {
     use std::path::Path;
 
     #[tokio::test]
-    async fn unsupported_execution_fails_before_running_a_command() {
+    async fn execution_is_enforced_or_refuses_before_running_a_command() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let result = crate::process::execute(
@@ -58,7 +58,13 @@ mod linux_contract {
         )
         .await;
 
-        assert!(result.unwrap_err().contains("no command was run"));
-        assert!(!Path::new(&marker).exists());
+        if crate::process::execution_available() {
+            let result = result.expect("available Linux backend should execute under containment");
+            assert_eq!(result.exit_code, 0);
+            assert!(Path::new(&marker).exists());
+        } else {
+            assert!(result.unwrap_err().contains("no command was run"));
+            assert!(!Path::new(&marker).exists());
+        }
     }
 }

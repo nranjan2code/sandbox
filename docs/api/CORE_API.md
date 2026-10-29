@@ -10,7 +10,7 @@ The Seatbelt backend delegates lifetime to its embedded native supervisor. It fi
 
 `SeatbeltBackend::create_process_with_lease(plan, optional_gate_path, optional_completion_path)` is the runtime handoff API. The runtime retains an exclusive Realm record lease and shares its separate execution gate before invoking it. The native supervisor retains that gate while cleaning descendants. Ordinary applications should use the runtime's leased executor rather than implement this protocol independently.
 
-`SeatbeltBackend::create_realm` returns an error. Its capability flags do not advertise runtime-owned Realm/promotion/rollback features. Linux stubs return backend-unavailable.
+`SeatbeltBackend::create_realm` returns an error. Its capability flags do not advertise runtime-owned Realm/promotion/rollback features. Linux uses `LandlockBackend` only when Landlock ABI 5+ and seccomp are available; its policy denies all network access and rejects policy shapes it cannot enforce.
 
 ## Policy schema
 

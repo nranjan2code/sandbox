@@ -2,7 +2,7 @@
 
 Runtime-independent process containment and durable project copies with reviewed promotion.
 
-**Current scope:** macOS Seatbelt, supervised commands, retained Realms, fingerprint-bound promotion, recovery and latest-promotion rollback. Linux process backends are unavailable. This is a constrained execution boundary, not a VM or a guarantee that arbitrary build systems will run unchanged.
+**Current scope:** macOS Seatbelt and Linux Landlock/seccomp supervised commands, retained Realms, fingerprint-bound promotion, recovery and latest-promotion rollback. Linux execution is enabled only when Landlock ABI 5+ and seccomp are available; otherwise commands are refused before launch. This is a constrained execution boundary, not a VM or a guarantee that arbitrary build systems will run unchanged.
 
 ## Supported behavior
 
@@ -11,6 +11,7 @@ Runtime-independent process containment and durable project copies with reviewed
 | Command authority | Explicit executable and arguments; argument paths never grant reads |
 | Filesystem | Explicit policy grants and overriding denies; CLI adds documented system runtime reads |
 | Network | Denied by default; library policies support explicit localhost ports; unsupported remote/DNS policies fail before launch |
+| Linux network | All socket creation and network syscalls are denied; Linux network allowances fail before launch |
 | Environment | Clear inherited environment; pass declared values only; reject loader-affecting variables |
 | Lifetime | Trusted native supervisor and group anchor; deny group/session changes and `posix_spawn`; verify cleanup before completion |
 | Persistent work | Runtime-owned private Realm store, separate workspace and control state |
@@ -20,11 +21,11 @@ Runtime-independent process containment and durable project copies with reviewed
 | Rollback | Latest committed promotion for that Realm, exact paths, original-project version checks |
 | Resources | CLI wall/output caps and copy/manifest/count bounds; no CPU, memory, process-count or disk-growth quota |
 
-`fork` followed by `exec` is supported. `setsid`, `setpgid`, indirect syscall dispatch and `posix_spawn` are blocked. Spawn attributes can detach a process inside the Darwin kernel, so a process-group signal alone is insufficient. Some interpreter launchers, process libraries and build tools require `posix_spawn` and will fail. Do not disable the gates or run failed work on the host as an automatic fallback. See [backend compatibility](docs/backends/BACKENDS.md).
+`fork` followed by `exec` is supported on both backends. macOS blocks `setsid`, `setpgid`, indirect syscall dispatch and `posix_spawn`. Linux drops the target's inherited capabilities and blocks session/group changes, mount and namespace operations, network syscalls, and attempts to signal processes outside the contained process group or its trusted supervisor. Some process libraries and build tools remain incompatible. Do not disable the gates or run failed work on the host as an automatic fallback. See [backend compatibility](docs/backends/BACKENDS.md).
 
 ## Build and verify
 
-Rust 1.90+, macOS command-line developer tools and `/usr/bin/sandbox-exec` are required for native execution. Cargo builds the small in-repo supervisor using the system C compiler and embeds it in the Seatbelt crate. No separately installed daemon or network listener is used.
+The current verification stack is Rust 1.99.1. Native execution builds the small in-repo supervisor using the system C compiler. macOS requires command-line developer tools and `/usr/bin/sandbox-exec`; Linux requires x86_64 or aarch64, a C compiler, Landlock ABI 5+, and seccomp filtering. The embedded supervisor uses no separately installed daemon or network listener.
 
 ```sh
 cargo build --locked --workspace
@@ -45,9 +46,9 @@ vaksb run --workspace /path/to/disposable-copy --cwd /path/to/disposable-copy \
   --timeout-seconds 30 --max-output-bytes 32768 -- /bin/sh -c 'printf ready'
 ```
 
-`capabilities` returns containment contract `2`, with supervised-process and detachment-gate declarations. It is a capability declaration, not proof that a particular command succeeded. Executing `run` always uses the supervisor; there is no unsupervised fallback.
+`capabilities` returns containment contract `2`, with supervised-process and detachment-gate declarations. It is a capability declaration, not proof that a particular command succeeded. On Linux, execution requires Landlock ABI 5+ and seccomp; the runner denies all network access. Executing `run` always uses the supervisor; there is no unsupervised fallback.
 
-System runtime read grants in `run` and the runtime executor include `/usr`, `/bin`, `/etc`, `/System`, `/Library`, `/opt` and `/dev` (canonicalized on macOS). These are broader than the selected project's files. The backend itself does not silently add those trees. Minimal bootstrap metadata, the root directory and standard null/random devices remain accessible. An explicitly selected executable outside the system roots gets a file read grant in `run`; its argument files and package ancestors do not.
+macOS system runtime reads include `/usr`, `/bin`, `/etc`, `/System`, `/Library`, `/opt` and `/dev`. Linux reads `/usr`, `/bin`, `/lib`, `/lib64`, the dynamic-loader cache when present, and explicitly discovered toolchain directories; it does not grant the `/etc` tree. Both platform lists are broader than the selected project's files. The backend itself does not silently add system trees. Minimal bootstrap metadata and standard null/random devices remain accessible. On macOS, `run` grants an explicitly selected executable outside the system trees as a single file; its argument files and package ancestors do not. Linux command executables must resolve within its granted runtime roots or discovered toolchain paths. Linux device ioctl operations are denied by Landlock.
 
 ## Durable project work
 

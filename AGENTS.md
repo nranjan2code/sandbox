@@ -49,7 +49,7 @@ cargo test --workspace
 cargo test --workspace --doc
 ```
 
-The root is a virtual Cargo workspace: root `tests/` files are not discovered. Put integration/security tests under the owning crate's `tests/`. macOS native tests must prove actual allowed/denied behavior, closed-stream deadline, detachment/spawn gates, fork/exec, no delayed writes after receipt/owner death, shared-gate exclusion and quarantine. Use temporary synthetic canaries/local listeners, no actual secrets or internet dependency. Linux tests do not prove Linux containment; its backends remain stubs.
+The root is a virtual Cargo workspace: root `tests/` files are not discovered. Put integration/security tests under the owning crate's `tests/`. macOS native tests must prove actual allowed/denied behavior, closed-stream deadline, detachment/spawn gates, fork/exec, no delayed writes after receipt/owner death, shared-gate exclusion and quarantine. Use temporary synthetic canaries/local listeners, no actual secrets or internet dependency. Linux tests exercise real Landlock/seccomp enforcement on the active kernel when ABI 5+ is available and otherwise prove fail-closed refusal; record Docker kernel/architecture and do not generalize one run to every Linux system.
 
 Freeze original expected bytes, paths, versions, permissions, interaction results and receipts before evaluating a fix. Keep failures as evidence; do not weaken assertions after a failure. Unit tests, safe rejection, lint success, a commit or an installed build do not replace the original intended outcome. Be explicit about unsupported toolchains, quotas, storage power-loss testing and platform coverage.
 

@@ -43,7 +43,7 @@ fn command_arguments_never_expand_read_permissions() {
     fs::write(&outside, "synthetic-canary").unwrap();
     let output = run(&work, "/bin/cat", &[outside.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, Vec::<u8>::new());
     let output = run(&work, "/bin/ls", &[temp.path().to_str().unwrap()]);
     assert!(!output.status.success());
     fs::write(work.join("inside"), "allowed").unwrap();

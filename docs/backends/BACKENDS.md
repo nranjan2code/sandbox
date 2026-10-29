@@ -32,9 +32,13 @@ Fork/exec descendants and explicit shell commands remain supported. Launchers an
 
 Supervisor binaries live in a fresh private directory under `/private/tmp`, independently of target `TMPDIR`. A write grant overlapping that storage (for example all of `/private/tmp`) is rejected. Choose a narrower project directory. CPU/memory/process-count/file-growth quotas remain unenforced.
 
-## Linux and other platforms
+## Linux Landlock and seccomp
 
-Linux Landlock/bubblewrap modules are stubs and report unavailable even if a `bwrap` binary exists. Process creation returns backend-unavailable before launching a command. Environment hashing/copying and durable metadata unit tests are not OS containment. No host execution fallback is permitted. Windows process containment is not implemented.
+`LandlockBackend` runs only on x86_64/aarch64 kernels that expose Landlock ABI 5+ and seccomp filtering. Its first-party C supervisor is built into the crate. The runtime probes both mechanisms before advertising process containment; if either is missing or the policy cannot be applied, creation fails before the target command starts. Bubblewrap is not used and its mere presence never enables execution.
+
+Landlock handles filesystem read, execute, write, create/remove, cross-directory rename/link, truncate and device-ioctl rights. Explicit canonical read/write roots are the only project grants; the runtime adds `/usr`, `/bin`, `/lib`, `/lib64`, the dynamic-loader cache when present and discovered toolchain directories. It does not grant the whole `/etc` tree. Standard null/random devices are separately granted. The backend removes all effective, permitted, inheritable and ambient Linux capabilities from the target before execution. It rejects policy denies, symlink-follow overrides, and any network allowance because it does not implement those semantics. Seccomp denies socket creation/use, session/group changes, namespace and mount operations, handle-based filesystem access, `clone3`, `io_uring`, ptrace, process-control routes and capability/keyring/BPF operations. A second filter limits `kill(2)` to the contained process group and denies thread-directed and pidfd signal routes. The target receives `/dev/null` as stdin, may use fork/exec, and cannot alter the trusted supervisor's process group. Descendants are reaped before a verified completion receipt releases the Realm execution gate.
+
+Linux grants are established before target execution and inherited by its descendants. This is not a VM, cgroup, or hostile same-user isolation boundary. CPU, memory, process-count and disk-growth quotas are not enforced; the user can still exhaust those host resources. Commands relying on blocked syscalls may fail. No host execution fallback is permitted. Windows process containment is not implemented.
 
 ## Extension rule
 

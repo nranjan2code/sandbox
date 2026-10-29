@@ -20,6 +20,8 @@ The host application owns authorization. No model text, script, tool response or
 | Output closes before command exits | Deadline/signal/exit/stream state stays active until completion | No CPU/memory/process-count quota |
 | Environment injects into trusted launcher | Clear ambient env; declared values only; reject loader controls | Explicitly permitted target credentials are intentionally visible to the target |
 | Network exfiltration | No network by default; supported localhost ports only | Configured system/runtime reads may reveal their granted content |
+| Linux network or local IPC egress | seccomp denies socket syscalls; signal targeting is restricted to the contained process group | No Linux network allowlist; inherited descriptors are limited to standard streams and close-on-exec control descriptors |
+| Linux filesystem escape, device control or inherited privilege | Landlock ABI 5+ handles explicit filesystem rights and device ioctls; target effective/permitted/inheritable/ambient capabilities are cleared; seccomp blocks mount/handle-based paths; descendants inherit the ruleset | Same-user host processes, kernel vulnerabilities, resource exhaustion and power-loss semantics are outside this containment claim |
 | Stale or partially reviewed apply | Current complete fingerprint, exact ordered paths and original version checks | Review still needs semantic inspection by the caller |
 | Recovery picks old same-content history | Persisted active transaction identity | Old-format interrupted metadata needs upgrade inspection |
 | Crash during apply/undo | Durable candidates/backups and phases, conflict refusal, directory-aware restore | Multi-file visibility is not globally atomic; power-loss testing not performed |
@@ -28,7 +30,7 @@ The host application owns authorization. No model text, script, tool response or
 
 ## Non-guarantees
 
-No VM boundary, CPU/memory/process-count/disk-growth quota, arbitrary remote-host/DNS firewall, automatic secret-content scanner, arbitrary unmodified build-tool support, globally atomic multi-file commit or semantic code verification is provided. Linux process isolation is unavailable. Runtime locks coordinate one canonical store, not external editors or separate stores.
+No VM boundary, CPU/memory/process-count/disk-growth quota, arbitrary remote-host/DNS firewall, automatic secret-content scanner, arbitrary unmodified build-tool support, globally atomic multi-file commit or semantic code verification is provided. Linux isolation is kernel-mediated containment, not a VM or a boundary against a hostile same-user host process. Runtime locks coordinate one canonical store, not external editors or separate stores.
 
 Do not weaken the boundary when a command fails. Keep unsupported execution, policy rejection, timeout, cancelled work, conflicting recovery and successful completion distinguishable. Neither safe rejection nor a valid receipt establishes correctness of a user's result.
 

@@ -1,10 +1,12 @@
 //! Bounded one-shot execution shared by persistent Realm commands.
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use vak_sandbox_core::{Policy, ProcessPlan, SandboxBackend};
+#[cfg(target_os = "linux")]
+use vak_sandbox_seatbelt::LandlockBackend;
 #[cfg(target_os = "macos")]
 use vak_sandbox_seatbelt::SeatbeltBackend;
 
@@ -18,27 +20,101 @@ pub struct CommandResult {
 
 /// Whether this build has an implemented OS process-containment backend.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub const fn execution_available() -> bool {
-    cfg!(target_os = "macos")
+    true
+}
+
+/// Whether Linux exposes the required Landlock and seccomp enforcement.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn execution_available() -> bool {
+    LandlockBackend.available()
+}
+
+/// Whether this build has an implemented OS process-containment backend.
+#[must_use]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub const fn execution_available() -> bool {
+    false
 }
 
 /// # Errors
 /// Returns backend, setup, signal-handler or verified-cleanup errors. Command failures remain in the returned receipt.
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(clippy::unused_async)
+)]
 pub async fn execute(
     workspace: &Path,
     cwd: &Path,
     command: &str,
     args: &[String],
 ) -> Result<CommandResult, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        execute_inner(workspace, cwd, command, args, None, None).await
+        execute_inner(
+            workspace,
+            cwd,
+            command,
+            args,
+            None,
+            None,
+            Some(std::time::Duration::from_secs(30)),
+            Some(32768),
+        )
+        .await
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (workspace, cwd, command, args);
-        Err("OS-isolated command execution requires macOS Seatbelt; no command was run".into())
+        Err(
+            "OS-isolated command execution is unavailable on this platform; no command was run"
+                .into(),
+        )
+    }
+}
+
+/// Execute a one-shot command with caller-selected bounded runtime and output.
+///
+/// # Errors
+/// Rejects unavailable containment and unsupported policy before starting a process.
+pub async fn execute_configured(
+    workspace: &Path,
+    cwd: &Path,
+    command: &str,
+    args: &[String],
+    timeout_seconds: Option<u64>,
+    max_output_bytes: Option<usize>,
+) -> Result<CommandResult, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        execute_inner(
+            workspace,
+            cwd,
+            command,
+            args,
+            None,
+            None,
+            timeout_seconds.map(std::time::Duration::from_secs),
+            max_output_bytes,
+        )
+        .await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (
+            workspace,
+            cwd,
+            command,
+            args,
+            timeout_seconds,
+            max_output_bytes,
+        );
+        Err(
+            "OS-isolated command execution is unavailable on this platform; no command was run"
+                .into(),
+        )
     }
 }
 
@@ -46,19 +122,25 @@ pub async fn execute(
 ///
 /// # Errors
 /// Returns lease handoff, policy, launch, execution-setup or cleanup errors.
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(clippy::unused_async)
+)]
 pub async fn execute_leased(
     lease: &mut crate::realm::RealmLease,
     cwd: &Path,
     command: &str,
     args: &[String],
 ) -> Result<CommandResult, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (lease, cwd, command, args);
-        Err("OS-isolated command execution requires macOS Seatbelt; no command was run".into())
+        Err(
+            "OS-isolated command execution is unavailable on this platform; no command was run"
+                .into(),
+        )
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         if lease.record.status != "running" {
             return Err("Call RealmStore::begin_execution before leased execution".into());
@@ -83,12 +165,19 @@ pub async fn execute_leased(
             args,
             Some(&lock),
             Some(lease.execution_receipt()),
+            Some(std::time::Duration::from_secs(30)),
+            Some(32768),
         )
         .await
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "Keep shared supervised-process lifecycle and its resource bounds in one path."
+)]
 async fn execute_inner(
     workspace: &Path,
     cwd: &Path,
@@ -96,24 +185,50 @@ async fn execute_inner(
     args: &[String],
     lease: Option<&Path>,
     completion: Option<&Path>,
+    timeout: Option<std::time::Duration>,
+    max_output_bytes: Option<usize>,
 ) -> Result<CommandResult, String> {
+    #[cfg(target_os = "macos")]
     let backend = SeatbeltBackend;
+    #[cfg(target_os = "linux")]
+    let backend = LandlockBackend;
     if !backend.available() {
-        return Err("OS-isolated execution requires macOS Seatbelt".into());
+        return Err("The required OS process-containment backend is unavailable".into());
     }
     let mut policy = Policy::deny_all()
         .allow_path_read(workspace.into())
         .allow_path_write(workspace.into());
-    for root in [
+    #[cfg(target_os = "macos")]
+    let system_roots = [
         "/usr", "/bin", "/etc", "/System", "/Library", "/opt", "/dev",
-    ] {
+    ];
+    #[cfg(target_os = "linux")]
+    let system_roots = ["/usr", "/bin", "/lib", "/lib64"];
+    for root in system_roots {
+        if !Path::new(root).exists() {
+            continue;
+        }
         policy = policy.allow_path_read(root.into());
     }
+    #[cfg(target_os = "linux")]
+    if Path::new("/etc/ld.so.cache").is_file() {
+        policy = policy.allow_path_read("/etc/ld.so.cache".into());
+    }
+    #[cfg(target_os = "macos")]
     let mut path_entries = vec![
         "/opt/homebrew/bin".to_string(),
         "/usr/local/bin".to_string(),
         "/usr/bin".to_string(),
         "/bin".to_string(),
+        "/usr/sbin".to_string(),
+        "/sbin".to_string(),
+    ];
+    #[cfg(target_os = "linux")]
+    let mut path_entries = vec![
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        "/usr/local/sbin".to_string(),
         "/usr/sbin".to_string(),
         "/sbin".to_string(),
     ];
@@ -184,7 +299,13 @@ async fn execute_inner(
         stderr: String::new(),
         stopped: None,
     };
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+    let deadline = async {
+        if let Some(timeout) = timeout {
+            tokio::time::sleep(timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     tokio::pin!(deadline);
     #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -194,18 +315,19 @@ async fn execute_inner(
     let mut exited = false;
     loop {
         tokio::select! {
-            () = &mut deadline => { result.stopped = Some("30 second runtime limit".into()); result.exit_code = 124; break; },
+            () = &mut deadline => { result.stopped = Some("runtime limit exceeded".into()); result.exit_code = 124; break; },
             _ = tokio::signal::ctrl_c() => { result.stopped = Some("cancelled".into()); result.exit_code = 130; break; },
             () = async { #[cfg(unix)] { term.recv().await; } #[cfg(not(unix))] { std::future::pending::<()>().await; } } => { result.stopped = Some("cancelled".into()); result.exit_code = 143; break; },
             code = &mut exit, if !exited => { result.exit_code = code.unwrap_or(-1); exited = true; },
             chunk = stdout.recv(), if !out_done => { if let Some(chunk) = chunk { result.stdout.push_str(&chunk); } else { out_done = true; } },
             chunk = stderr.recv(), if !err_done => { if let Some(chunk) = chunk { result.stderr.push_str(&chunk); } else { err_done = true; } },
         }
-        if result.stdout.len() + result.stderr.len() > 32768 {
-            result.stopped = Some("32 KiB output limit".into());
+        if max_output_bytes.is_some_and(|limit| result.stdout.len() + result.stderr.len() > limit) {
+            result.stopped = Some("output limit exceeded".into());
             result.exit_code = 125;
             // Keep UTF-8 valid while bounding the returned receipt.
-            while result.stdout.len() + result.stderr.len() > 32768 {
+            let limit = max_output_bytes.unwrap_or_default();
+            while result.stdout.len() + result.stderr.len() > limit {
                 if result.stderr.is_empty() {
                     result.stdout.pop();
                 } else {
