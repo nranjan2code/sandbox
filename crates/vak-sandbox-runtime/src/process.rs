@@ -1,8 +1,11 @@
 //! Bounded one-shot execution shared by persistent Realm commands.
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use vak_sandbox_core::{Policy, ProcessPlan, SandboxBackend};
+#[cfg(target_os = "macos")]
 use vak_sandbox_seatbelt::SeatbeltBackend;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,52 +18,71 @@ pub struct CommandResult {
 
 /// # Errors
 /// Returns backend, setup, signal-handler or verified-cleanup errors. Command failures remain in the returned receipt.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 pub async fn execute(
     workspace: &Path,
     cwd: &Path,
     command: &str,
     args: &[String],
 ) -> Result<CommandResult, String> {
-    execute_inner(workspace, cwd, command, args, None, None).await
+    #[cfg(target_os = "macos")]
+    {
+        execute_inner(workspace, cwd, command, args, None, None).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (workspace, cwd, command, args);
+        Err("OS-isolated command execution requires macOS Seatbelt; no command was run".into())
+    }
 }
 
 /// Execute while the native supervisor retains the Realm lease through cleanup.
 ///
 /// # Errors
 /// Returns lease handoff, policy, launch, execution-setup or cleanup errors.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 pub async fn execute_leased(
     lease: &mut crate::realm::RealmLease,
     cwd: &Path,
     command: &str,
     args: &[String],
 ) -> Result<CommandResult, String> {
-    if lease.record.status != "running" {
-        return Err("Call RealmStore::begin_execution before leased execution".into());
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (lease, cwd, command, args);
+        Err("OS-isolated command execution requires macOS Seatbelt; no command was run".into())
     }
-    let metadata =
-        std::fs::symlink_metadata(lease.execution_receipt()).map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > 256 {
-        return Err("Invalid initial execution receipt".into());
+    #[cfg(target_os = "macos")]
+    {
+        if lease.record.status != "running" {
+            return Err("Call RealmStore::begin_execution before leased execution".into());
+        }
+        let metadata = std::fs::symlink_metadata(lease.execution_receipt())
+            .map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() > 256 {
+            return Err("Invalid initial execution receipt".into());
+        }
+        let initial: vak_sandbox_core::backend::ProcessCompletion = serde_json::from_slice(
+            &std::fs::read(lease.execution_receipt()).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if initial.cleanup_verified || initial.exit_code != -1 {
+            return Err("Leased execution requires a fresh unverified completion receipt".into());
+        }
+        let lock = lease.execution_lock().map_err(|error| error.to_string())?;
+        execute_inner(
+            &lease.record.workspace,
+            cwd,
+            command,
+            args,
+            Some(&lock),
+            Some(lease.execution_receipt()),
+        )
+        .await
     }
-    let initial: vak_sandbox_core::backend::ProcessCompletion = serde_json::from_slice(
-        &std::fs::read(lease.execution_receipt()).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    if initial.cleanup_verified || initial.exit_code != -1 {
-        return Err("Leased execution requires a fresh unverified completion receipt".into());
-    }
-    let lock = lease.execution_lock().map_err(|error| error.to_string())?;
-    execute_inner(
-        &lease.record.workspace,
-        cwd,
-        command,
-        args,
-        Some(&lock),
-        Some(lease.execution_receipt()),
-    )
-    .await
 }
 
+#[cfg(target_os = "macos")]
 async fn execute_inner(
     workspace: &Path,
     cwd: &Path,
@@ -123,10 +145,7 @@ async fn execute_inner(
         }
     }
 
-    policy.env.set.insert(
-        "PATH".into(),
-        path_entries.join(":"),
-    );
+    policy.env.set.insert("PATH".into(), path_entries.join(":"));
     policy
         .env
         .set

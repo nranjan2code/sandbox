@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Linux Landlock and Bubblewrap placeholders now report unavailable; binary presence cannot imply process containment without an implemented and verified policy backend. The runtime compiles on Linux and refuses execution before command launch. Latest Rust diagnostics in the affected tests are also corrected.
+
 ### Security and correctness hardening (2026-10-28)
 
 #### Security

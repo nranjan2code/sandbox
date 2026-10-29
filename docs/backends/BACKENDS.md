@@ -34,7 +34,7 @@ Supervisor binaries live in a fresh private directory under `/private/tmp`, inde
 
 ## Linux and other platforms
 
-Linux Landlock/bubblewrap modules are stubs. Process creation returns backend-unavailable. Environment hashing/copying and durable metadata unit tests are not OS containment. No host execution fallback is permitted. Windows process containment is not implemented.
+Linux Landlock/bubblewrap modules are stubs and report unavailable even if a `bwrap` binary exists. Process creation returns backend-unavailable before launching a command. Environment hashing/copying and durable metadata unit tests are not OS containment. No host execution fallback is permitted. Windows process containment is not implemented.
 
 ## Extension rule
 

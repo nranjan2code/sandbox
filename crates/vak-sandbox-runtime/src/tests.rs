@@ -41,3 +41,24 @@ mod cases {
         assert!(mgr.heartbeat_monitor().is_alive(&h.realm_id));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_contract {
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn unsupported_execution_fails_before_running_a_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-exist");
+        let result = crate::process::execute(
+            temp.path(),
+            temp.path(),
+            "/usr/bin/touch",
+            &[marker.display().to_string()],
+        )
+        .await;
+
+        assert!(result.unwrap_err().contains("no command was run"));
+        assert!(!Path::new(&marker).exists());
+    }
+}

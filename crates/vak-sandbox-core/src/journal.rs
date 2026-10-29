@@ -312,7 +312,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mut journal = PromotionJournal::new(td.path()).unwrap();
         let id = journal.begin("realm1", Path::new("/tmp/base")).unwrap();
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         journal.commit().unwrap();
         let entries = journal.load_journal(&id).unwrap();
         assert!(

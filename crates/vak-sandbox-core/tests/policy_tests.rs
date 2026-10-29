@@ -9,8 +9,8 @@ mod tests {
     fn deny_all_default() {
         let p = Policy::deny_all();
         assert!(!p.network.allow);
-        assert!(p.fs.allow_read.is_empty());
-        assert!(p.fs.allow_write.is_empty());
+        assert_eq!(p.fs.allow_read, Vec::<std::path::PathBuf>::new());
+        assert_eq!(p.fs.allow_write, Vec::<std::path::PathBuf>::new());
         assert!(p.env.allow.is_empty());
     }
 
