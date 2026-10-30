@@ -25,10 +25,11 @@ Runtime-independent process containment and durable project copies with reviewed
 
 Ordinary target stdin stays `/dev/null`. The explicit `create_interactive_process` API gives a persistent, invocation-scoped worker a full-duplex private descriptor 3; it does not reuse the supervisor's lifetime pipe. This channel does not grant filesystem or network access and must be paired with a narrowly scoped process policy.
 
-The `vaksb worker` CLI exposes that boundary for a host that supervises a persistent sidecar. It requires an existing working directory inside an explicit read/write grant, an explicit executable, and repeated `--env KEY=VALUE` entries. Worker protocol bytes travel on descriptor 3 (the wrapper's stdin/stdout); target stdout and stderr are forwarded to wrapper stderr for diagnostics. Worker startup skips the durable Realm store. This command is a containment primitive: the host still owns task admission, user approval, workspace scoping, lifecycle policy, and receipts.
+The `vaksb worker` CLI exposes that boundary for a host that supervises a persistent sidecar. It requires an existing working directory inside an explicit read/write grant, an explicit executable, and repeated `--env KEY=VALUE` entries. macOS Seatbelt enforces repeated `--deny` paths, including descendants, to carve native-owned stores out of a broader data root. Linux Landlock currently refuses nested deny paths before launch because it cannot enforce that exclusion over a parent grant. Worker protocol bytes travel on descriptor 3 (the wrapper's stdin/stdout); target stdout and stderr are forwarded to wrapper stderr for diagnostics. Worker startup skips the durable Realm store. This command is a containment primitive: the host still owns task admission, user approval, workspace scoping, lifecycle policy, and receipts.
 
 ```sh
 vaksb worker --cwd ./workspace --read ./workspace --write ./workspace \
+  --deny ./workspace/protected \
   --env PATH=/usr/bin:/bin --command /path/to/sidecar -- --stdio-protocol
 ```
 

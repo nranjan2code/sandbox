@@ -8,18 +8,27 @@ use std::process::{Command, Stdio};
 fn worker_cli_relays_private_descriptor_without_using_target_stdin() {
     let workspace = tempfile::tempdir().unwrap();
     let store = workspace.path().join("must-not-be-created");
+    let protected = workspace.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    std::fs::write(protected.join("key"), b"do-not-read").unwrap();
+    #[cfg(target_os = "macos")]
+    let script = "if read -r line <&0; then exit 77; fi; if [ -r ./protected/key ]; then exit 88; fi; read -r line <&3; printf 'echo:%s\\n' \"$line\" >&3";
+    #[cfg(target_os = "linux")]
     let script = "if read -r line <&0; then exit 77; fi; read -r line <&3; printf 'echo:%s\\n' \"$line\" >&3";
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vaksb"))
-        .arg("--store")
-        .arg(&store)
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vaksb"));
+    command.arg("--store").arg(&store).args([
+        "worker",
+        "--cwd",
+        workspace.path().to_str().unwrap(),
+        "--read",
+        workspace.path().to_str().unwrap(),
+        "--write",
+        workspace.path().to_str().unwrap(),
+    ]);
+    #[cfg(target_os = "macos")]
+    command.args(["--deny", protected.to_str().unwrap()]);
+    let mut child = command
         .args([
-            "worker",
-            "--cwd",
-            workspace.path().to_str().unwrap(),
-            "--read",
-            workspace.path().to_str().unwrap(),
-            "--write",
-            workspace.path().to_str().unwrap(),
             "--env",
             "PATH=/usr/bin:/bin",
             "--command",
@@ -47,4 +56,39 @@ fn worker_cli_relays_private_descriptor_without_using_target_stdin() {
     );
     assert_eq!(output.stdout, b"echo:private-channel\n");
     assert!(!store.exists(), "worker startup must not create host state");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_cli_refuses_nested_exclusions_before_launch() {
+    let workspace = tempfile::tempdir().unwrap();
+    let protected = workspace.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    let marker = workspace.path().join("started");
+    let output = Command::new(env!("CARGO_BIN_EXE_vaksb"))
+        .args([
+            "worker",
+            "--cwd",
+            workspace.path().to_str().unwrap(),
+            "--read",
+            workspace.path().to_str().unwrap(),
+            "--write",
+            workspace.path().to_str().unwrap(),
+            "--deny",
+            protected.to_str().unwrap(),
+            "--env",
+            "PATH=/usr/bin:/bin",
+            "--command",
+            "/bin/sh",
+            "--",
+            "-c",
+            "printf started > started",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !marker.exists(),
+        "unsupported policy must refuse before launch"
+    );
 }

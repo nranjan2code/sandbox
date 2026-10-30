@@ -21,9 +21,10 @@ struct Cli {
 fn capability_report() -> serde_json::Value {
     let execution_available = vak_sandbox_runtime::process::execution_available();
     serde_json::json!({
-        "contract": 2,
+        "contract": 3,
         "execution_available": execution_available,
         "interactive_worker_io": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
+        "filesystem_exclusions": execution_available && cfg!(target_os = "macos"),
         "supervised_processes": execution_available,
         "detachment_denied": execution_available,
         "posix_spawn_denied": cfg!(target_os = "macos") && execution_available,
@@ -39,6 +40,7 @@ async fn run_interactive_worker(
     cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    denied_paths: Vec<PathBuf>,
     environment: Vec<String>,
     command: String,
     args: Vec<String>,
@@ -72,6 +74,10 @@ async fn run_interactive_worker(
             .allow_path_read(root.clone())
             .allow_path_write(root.clone());
         admitted_roots.push(root);
+    }
+    for path in denied_paths {
+        let path = std::fs::canonicalize(path)?;
+        policy.fs.deny.push(path);
     }
     #[cfg(target_os = "macos")]
     let system_roots = [
@@ -239,6 +245,9 @@ enum Commands {
         /// Existing writable roots; repeat for each root
         #[arg(long = "write")]
         write_roots: Vec<PathBuf>,
+        /// Existing paths denied even when inside a read or write grant; repeat for each path
+        #[arg(long = "deny")]
+        denied_paths: Vec<PathBuf>,
         /// Exact environment value as KEY=VALUE; repeat for each variable
         #[arg(long = "env")]
         environment: Vec<String>,
@@ -587,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
             cwd,
             read_roots,
             write_roots,
+            denied_paths,
             environment,
             command,
             args,
@@ -597,6 +607,7 @@ async fn main() -> anyhow::Result<()> {
                     cwd,
                     read_roots,
                     write_roots,
+                    denied_paths,
                     environment,
                     command,
                     args,
@@ -608,7 +619,15 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
-                let _ = (cwd, read_roots, write_roots, environment, command, args);
+                let _ = (
+                    cwd,
+                    read_roots,
+                    write_roots,
+                    denied_paths,
+                    environment,
+                    command,
+                    args,
+                );
                 anyhow::bail!("interactive OS containment is unavailable on this platform");
             }
         }
@@ -800,6 +819,10 @@ mod cli_tests {
         let available = report["execution_available"].as_bool().unwrap();
         assert_eq!(report["supervised_processes"], available);
         assert_eq!(report["detachment_denied"], available);
+        assert_eq!(
+            report["filesystem_exclusions"],
+            cfg!(target_os = "macos") && available
+        );
         assert_eq!(
             report["posix_spawn_denied"],
             cfg!(target_os = "macos") && available

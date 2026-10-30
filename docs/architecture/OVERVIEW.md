@@ -12,7 +12,7 @@ Host application / CLI (owns authorization)
                  └─ sandbox-exec → command → fork/exec descendants
 ```
 
-The supervisor is small in-repo C compiled using macOS system headers; Rust retains `unsafe_code = "deny"`. The trusted executables are materialized in a private directory outside target-writable scopes, independently of caller-controlled `TMPDIR`. Loader injection variables are rejected before those processes start.
+The supervisor is small in-repo C compiled using macOS system headers; Rust retains `unsafe_code = "deny"`. The trusted executables are materialized in a private directory outside target-writable scopes, independently of caller-controlled `TMPDIR`. Loader injection variables are rejected before those processes start. The worker CLI can apply nested deny paths on macOS; Linux Landlock currently refuses nested denies before target launch because additive parent grants cannot enforce that carve-out.
 
 ## Process lifetime
 
