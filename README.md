@@ -11,7 +11,7 @@ Runtime-independent process containment and durable project copies with reviewed
 | Command authority | Explicit executable and arguments; argument paths never grant reads |
 | Filesystem | Explicit policy grants and overriding denies; CLI adds documented system runtime reads |
 | Network | Denied by default; library policies support explicit localhost ports; unsupported remote/DNS policies fail before launch |
-| Linux network | All socket creation and network syscalls are denied; Linux network allowances fail before launch |
+| Linux network | Socket creation and network dispatch are denied; only `SO_TYPE` inspection on private descriptor 3 is allowed for interactive workers; network allowances fail before launch |
 | Environment | Clear inherited environment; pass declared values only; reject loader-affecting variables |
 | Lifetime | Trusted native supervisor and group anchor; deny group/session changes and `posix_spawn`; verify cleanup before completion |
 | Persistent work | Runtime-owned private Realm store, separate workspace and control state |

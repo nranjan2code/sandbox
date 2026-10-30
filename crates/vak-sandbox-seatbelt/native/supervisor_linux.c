@@ -246,7 +246,7 @@ static int install_signal_guard(pid_t target_group) {
     return 0;
 }
 
-static int install_seccomp(void) {
+static int install_seccomp(int interactive) {
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  (uint32_t)offsetof(struct seccomp_data, arch)),
@@ -294,7 +294,22 @@ static int install_seccomp(void) {
         DENY_SYSCALL(__NR_setsockopt, EPERM),
 #endif
 #ifdef __NR_getsockopt
-        DENY_SYSCALL(__NR_getsockopt, EPERM),
+        /* Runtime stream wrappers inspect the inherited private channel. Only
+         * its socket type is readable; this adds no socket creation or egress. */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getsockopt, 0, 8),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 (uint32_t)offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 3, 0, 5),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 (uint32_t)offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOL_SOCKET, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 (uint32_t)offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SO_TYPE, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, interactive ? SECCOMP_RET_ALLOW : (SECCOMP_RET_ERRNO | EPERM)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 (uint32_t)offsetof(struct seccomp_data, nr)),
 #endif
 #ifdef __NR_setsid
         DENY_SYSCALL(__NR_setsid, EPERM),
@@ -608,7 +623,7 @@ int main(int argc, char **argv) {
         }
         if (drop_child_privileges() != 0 || setpgid(0, 0) != 0 || chdir(cwd) != 0 ||
             install_landlock(reads, read_count, writes, write_count) != 0 ||
-            install_signal_guard(getpid()) != 0 || install_seccomp() != 0) {
+            install_signal_guard(getpid()) != 0 || install_seccomp(worker_input >= 0) != 0) {
             (void)fprintf(stderr, "Linux supervisor: restriction setup failed: %s\n",
                           strerror(errno));
             _exit(126);

@@ -43,3 +43,7 @@ Linux grants are established before target execution and inherited by its descen
 ## Extension rule
 
 Reject unsupported policies and advertise only implemented capabilities. A new backend must prove execution lifetime, environment filtering, path rules and denied/allowed endpoints with actual OS tests. Containment must not implicitly gain promotion authority.
+
+### Linux private descriptor inspection
+
+Interactive workers may call only `getsockopt(3, SOL_SOCKET, SO_TYPE)` to let runtime stream wrappers recognize the existing Unix stream. The same call on another descriptor, another option on descriptor 3, and every such call in ordinary execution is refused. Socket creation/pairs, connect/bind/listen/accept, option mutation, sendmsg/recvmsg descriptor passing and network dispatch remain denied. Read/write on the already connected private channel remain the only worker protocol path. ARM64 Docker verifies the exact allowed/denied calls and an actual Node 26 stream wrapper; this does not prove x86_64 or a packaged Linux desktop app.

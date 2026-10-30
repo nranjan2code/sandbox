@@ -190,6 +190,53 @@ fn completion_inside_target_grant_or_existing_record_refuses_before_launch() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_socket_type_query_does_not_enable_other_socket_operations() {
+    let workspace = tempfile::tempdir().unwrap();
+    let control = private_control();
+    let source = workspace.path().join("probe.c");
+    std::fs::write(&source, include_str!("fixtures/interactive_socket_linux.c")).unwrap();
+    let compiled = Command::new("cc")
+        .args(["-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(workspace.path().join("probe"))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let receipt = control.path().join("invocation-1.json");
+    let mut child = completion_worker(workspace.path(), &receipt, "exec ./probe");
+    let mut owner = child.stdin.take().unwrap();
+    owner.write_all(b"request").unwrap();
+    let output = child.wait_with_output().unwrap();
+    drop(owner);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"private-channel-ok\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_vaksb"))
+        .args(["run", "--workspace"])
+        .arg(workspace.path())
+        .arg("--")
+        .arg(workspace.path().join("probe"))
+        .arg("ordinary")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ordinary-denied\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn worker_cli_refuses_nested_exclusions_before_launch() {
     let workspace = tempfile::tempdir().unwrap();
     let protected = workspace.path().join("protected");

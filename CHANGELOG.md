@@ -5,6 +5,7 @@
 - Containment contract 4: optional paired host-private completion record and exact invocation ID, exclusive admission outside all target grants, owner-only directory/file and synchronized unverified/verified states.
 - Host EOF cancels even a worker that ignores its protocol channel; verified cleanup stays separate from target exit status and untrusted output.
 - Bounded input bridge fixes async-stdin shutdown retention. Rust toolchain pinned to 1.99.1; no dependency added.
+- Linux private descriptor 3 allows only socket-type inspection for runtime stream wrappers. Other socket metadata/options, creation, dispatch and descriptor passing remain denied; ordinary commands receive no exception.
 - App/task integration, resource quotas, physical power-loss testing and installed-client verification remain separate gates.
 
 
