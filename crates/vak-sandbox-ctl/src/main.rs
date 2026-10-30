@@ -6,6 +6,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vak_sandbox_env::EnvStore;
 use vak_sandbox_runtime::{CreateRealmRequest, SandboxManager};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod worker_completion;
+
 #[derive(Parser)]
 #[command(name = "vaksb")]
 #[command(about = "vak-sandbox CLI - Safe agent code execution with reviewable promotion", long_about = None)]
@@ -21,9 +24,10 @@ struct Cli {
 fn capability_report() -> serde_json::Value {
     let execution_available = vak_sandbox_runtime::process::execution_available();
     serde_json::json!({
-        "contract": 3,
+        "contract": 4,
         "execution_available": execution_available,
         "interactive_worker_io": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
+        "worker_completion_records": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
         "filesystem_exclusions": execution_available && cfg!(target_os = "macos"),
         "supervised_processes": execution_available,
         "detachment_denied": execution_available,
@@ -34,6 +38,7 @@ fn capability_report() -> serde_json::Value {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "Worker admission, private-channel lifetime, and cleanup are one security boundary."
 )]
 async fn run_interactive_worker(
@@ -44,6 +49,7 @@ async fn run_interactive_worker(
     environment: Vec<String>,
     command: String,
     args: Vec<String>,
+    completion: Option<worker_completion::CompletionRequest>,
 ) -> anyhow::Result<i32> {
     use std::collections::HashMap;
     use tokio::io::{AsyncWriteExt, copy, split};
@@ -127,6 +133,9 @@ async fn run_interactive_worker(
         env: HashMap::new(),
         policy,
     };
+    let completion = completion
+        .map(|request| worker_completion::CompletionRecord::prepare(request, &admitted_roots))
+        .transpose()?;
     let env = backend.create_interactive_process(&plan).await?;
     let mut handle = env
         .exec_interactive(&plan.command, &args, &HashMap::new())
@@ -136,11 +145,33 @@ async fn run_interactive_worker(
         .take()
         .ok_or_else(|| anyhow::anyhow!("interactive backend omitted private descriptor 3"))?;
     let (mut worker_read, mut worker_write) = split(worker_io);
-    let input_task = tokio::spawn(async move {
-        let mut input = tokio::io::stdin();
-        let copied = copy(&mut input, &mut worker_write).await;
-        let shutdown = worker_write.shutdown().await;
-        copied.and(shutdown)
+    // Tokio stdin uses an uncancellable blocking-pool read. That prevents CLI
+    // runtime shutdown when the target exits while its host keeps stdin open.
+    // A bounded bridge on a detached std thread does not retain runtime shutdown.
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(2);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        loop {
+            let mut bytes = vec![0; 8192];
+            let result = std::io::stdin().read(&mut bytes).map(|count| {
+                bytes.truncate(count);
+                bytes
+            });
+            let terminal = !matches!(&result, Ok(bytes) if !bytes.is_empty());
+            if input_tx.blocking_send(result).is_err() || terminal {
+                break;
+            }
+        }
+    });
+    let mut input_task = tokio::spawn(async move {
+        while let Some(bytes) = input_rx.recv().await {
+            let bytes = bytes?;
+            if bytes.is_empty() {
+                break;
+            }
+            worker_write.write_all(&bytes).await?;
+        }
+        worker_write.shutdown().await
     });
     let output_task = tokio::spawn(async move {
         let mut output = tokio::io::stdout();
@@ -165,9 +196,18 @@ async fn run_interactive_worker(
     let mut exit = handle.exit_code;
     let mut output_task = output_task;
     let mut output_finished = false;
+    let mut owner_closed = false;
     let exit_code = loop {
         tokio::select! {
             code = &mut exit => break code.unwrap_or(-1),
+            result = &mut input_task => {
+                // EOF is owner cancellation even if the target ignores its
+                // private stream. Only backend completion can prove cleanup.
+                env.destroy().await?;
+                result??;
+                owner_closed = true;
+                break exit.await.unwrap_or(-1);
+            }
             result = &mut output_task, if !output_finished => {
                 output_finished = true;
                 if !matches!(result, Ok(Ok(_))) {
@@ -177,8 +217,10 @@ async fn run_interactive_worker(
             }
         }
     };
-    input_task.abort();
-    let _ = input_task.await;
+    if !owner_closed {
+        input_task.abort();
+        let _ = input_task.await;
+    }
     if !output_finished {
         tokio::time::timeout(std::time::Duration::from_secs(5), output_task)
             .await??
@@ -187,6 +229,9 @@ async fn run_interactive_worker(
     stdout_task.await??;
     stderr_task.await??;
     env.destroy().await?;
+    if let Some(completion) = completion {
+        completion.complete(exit_code)?;
+    }
     Ok(exit_code)
 }
 
@@ -251,6 +296,12 @@ enum Commands {
         /// Exact environment value as KEY=VALUE; repeat for each variable
         #[arg(long = "env")]
         environment: Vec<String>,
+        /// Host-private cleanup evidence outside all target grants
+        #[arg(long, requires = "invocation_id")]
+        completion_record: Option<PathBuf>,
+        /// Exact host invocation identity bound to the completion record
+        #[arg(long, requires = "completion_record")]
+        invocation_id: Option<String>,
         /// Explicit executable
         #[arg(long)]
         command: String,
@@ -598,6 +649,8 @@ async fn main() -> anyhow::Result<()> {
             write_roots,
             denied_paths,
             environment,
+            completion_record,
+            invocation_id,
             command,
             args,
         } => {
@@ -611,6 +664,14 @@ async fn main() -> anyhow::Result<()> {
                     environment,
                     command,
                     args,
+                    completion_record
+                        .zip(invocation_id)
+                        .map(
+                            |(path, invocation_id)| worker_completion::CompletionRequest {
+                                path,
+                                invocation_id,
+                            },
+                        ),
                 )
                 .await?;
                 if code != 0 {
@@ -627,6 +688,8 @@ async fn main() -> anyhow::Result<()> {
                     environment,
                     command,
                     args,
+                    completion_record,
+                    invocation_id,
                 );
                 anyhow::bail!("interactive OS containment is unavailable on this platform");
             }

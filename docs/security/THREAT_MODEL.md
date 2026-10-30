@@ -17,6 +17,7 @@ The host application owns authorization. No model text, script, tool response or
 | Parent allow root overrides credential deny | Explicit denies emitted after allows | Filename exclusions do not scan secret contents |
 | Child detaches and writes after receipt | Kernel group/session/spawn gates plus trusted anchored group, cleanup verification | Unmodified spawn-based tools may be unsupported |
 | Owner is killed during execution | Native owner/anchor lifelines plus retained Realm execution gate | Crashes can leave private temporary executables for maintenance |
+| Worker spoofs a cleanup receipt | Exclusive host-private record outside all target grants, bound invocation ID; stdout/stderr never authorize settlement | Host must validate the exact record, retain uncertainty on absent/corrupt evidence and bind it to its durable task/run |
 | Output closes before command exits | Deadline/signal/exit/stream state stays active until completion | No CPU/memory/process-count quota |
 | Environment injects into trusted launcher | Clear ambient env; declared values only; reject loader controls | Explicitly permitted target credentials are intentionally visible to the target |
 | Network exfiltration | No network by default; supported localhost ports only | Configured system/runtime reads may reveal their granted content |

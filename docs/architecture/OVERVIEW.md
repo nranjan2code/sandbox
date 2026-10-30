@@ -46,3 +46,7 @@ The original project is outside this tree. Target policy grants its workspace, n
 ## Public boundaries
 
 `SandboxManager` chooses project, empty or verified-environment creation and delegates persistence to `RealmStore`. The backend owns process containment only. Its direct legacy Realm API is rejected and its capability flags do not claim promotion/rollback. Environment provisioning/copying owns no execution authority: `check_env` is static and refuses executable post-checks. Host applications still own consent, user-visible review and receipt interpretation.
+
+## Interactive host receipt handoff
+
+The CLI may create an exclusive owner-only completion record in an existing private directory outside all target grants. It synchronizes unverified state before backend launch, then synchronizes the exact invocation identity and verified target exit code only after the backend’s private cleanup proof and environment teardown. The target protocol descriptor and diagnostic streams never carry this authority. EOF on the host’s input closes the worker channel and asks the backend to stop and verify the whole process tree. A bounded input bridge avoids retaining runtime shutdown on an uncancellable async stdin read. Missing/unverified output remains uncertainty; file persistence is not a physical power-loss proof.

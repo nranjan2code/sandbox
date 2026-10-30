@@ -82,3 +82,7 @@ The runtime distinguishes an ordinary target exit 126 from unverified cleanup us
 ## Limits
 
 Realm command 30 s / 32 KiB output; copy 512 MiB / 50,000 entries / 8 MiB manifest; 32 retained Realms; 200 changes per promotion; 20 changes and 16 KiB file text per page. Regular files/directories only. Common credential filenames are excluded, not secret contents. Linux requires Landlock ABI 5+ and seccomp; it does not enforce CPU, memory, process-count or disk-growth quotas. Heartbeats are process-local observations, not an independent persistent service health monitor.
+
+## Interactive worker completion
+
+For a worker with a durable host run, supply paired `--completion-record` and `--invocation-id` options. Use an owner-only control directory outside every target grant and a fresh filename; an existing path is never overwritten at admission. Keep the exact identity/path in the host’s durable run record. Host stdin EOF requests cancellation even when the worker ignores its channel. After helper termination, validate the complete bounded JSON record and exact invocation identity. `cleanup_verified:true` proves backend cleanup, while `exit_code` reports target outcome; 126 can be an ordinary target failure. Missing/false/corrupt proof cannot release uncertain charges or authorize replay. A successful task outcome still needs independent evidence.

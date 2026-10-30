@@ -1,10 +1,17 @@
-# Upgrading to containment contract 2
+# Upgrading to containment contract 4
+
+Contract 4 adds host-private completion records for interactive workers and makes host stdin EOF cancel their contained process tree. `worker_completion_records` is true only with supported interactive containment. Both `--completion-record` and `--invocation-id` must be supplied together. The record parent must exist, be owner-only, and sit outside every worker grant (including fixed runtime reads); an existing record refuses launch. The helper synchronizes `{version:1, invocation_id, cleanup_verified:false, exit_code:null}` before attempting target launch. Only validated backend cleanup can update it to `cleanup_verified:true` with the actual target exit code in 0–255.
+
+A target failure (including 126), EOF cancellation, and cleanup proof are separate facts. Do not parse protocol stdout or diagnostic stderr for receipts. Missing, partial, invalid, false or mismatched records retain execution uncertainty; no automatic replay/refund is authorized. The helper uses a bounded input bridge whose detached blocking reader does not retain async runtime shutdown after target exit. Read/stream failures may leave unverified evidence even after cleanup; callers must preserve it for explicit reconciliation. The host remains responsible for task/run binding, bounded framing/deadlines, process accounting and recovery. No CPU/memory/process-count/disk quota is added. The build toolchain is pinned to Rust 1.99.1.
+
+## Earlier containment changes
+
 
 This hardening changes behavior intentionally. Rebuild the sandbox helper and test a disposable fixture before relying on it. Updating source or pushing a commit does not replace an installed app/helper or restart running commands. No Vakyartha source or installed data is part of this sandbox-only change.
 
 ## Client contract
 
-`vaksb capabilities` returns JSON with `contract: 2`, `execution_available`, `supervised_processes`, `detachment_denied` and `posix_spawn_denied`. macOS uses the Seatbelt supervisor. Linux reports execution only when Landlock ABI 5+ and seccomp are available; Linux denies network access and rejects unsupported policy shapes. Other unsupported platforms report false and refuse before launch. Check the contract and actual platform rather than version/help strings alone. The executable/argument, `run`, Realm CLI and receipt shapes remain, with one additional Realm control-record field: `active_transaction`.
+`vaksb capabilities` returns JSON with `contract: 4`, `execution_available`, `supervised_processes`, `detachment_denied` and `posix_spawn_denied`. macOS uses the Seatbelt supervisor. Linux reports execution only when Landlock ABI 5+ and seccomp are available; Linux denies network access and rejects unsupported policy shapes. Other unsupported platforms report false and refuse before launch. Check the contract and actual platform rather than version/help strings alone. The executable/argument, `run`, Realm CLI and receipt shapes remain, with one additional Realm control-record field: `active_transaction`.
 
 No argument-derived read grants remain. Callers that previously depended on a script/package argument outside the workspace must stage their approved code in the workspace or provide an explicit trusted read policy through the library. Do not infer package roots from argument paths. System runtime roots remain explicit read grants, not private-project data guarantees.
 
