@@ -121,7 +121,14 @@ int main(int argc, char **argv) {
     if (anchor < 0) die("anchor fork");
     if (anchor == 0) {
         close(result[0]); close(life[1]);
-        if (setpgid(0, 0)) die("anchor group");
+        /* One owner establishes the group. Do not race a second setpgid in
+         * the child against parent setup/teardown. No target exists before
+         * the parent's handoff, and EOF cannot kill an unrelated old group. */
+        char admitted = 0;
+        ssize_t count;
+        do { count = read(life[0], &admitted, 1); } while (count < 0 && errno == EINTR);
+        if (count != 1 || admitted != 'G') _exit(126);
+        if (getpgrp() != getpid()) { errno = EPERM; die("anchor group identity"); }
         pid_t target = fork();
         if (target < 0) group_exit();
         if (target == 0) {
@@ -156,8 +163,8 @@ int main(int argc, char **argv) {
     }
     if (worker_input >= 0) close(worker_input);
     close(result[1]); close(life[0]);
-    /* Both processes establish the group before target code can execute. */
-    if (setpgid(anchor, anchor) && errno != EACCES) {
+    /* The anchor is waiting on the private lifeline and cannot fork a target. */
+    if (setpgid(anchor, anchor) || write(life[1], "G", 1) != 1) {
         close(life[1]); kill(anchor, SIGKILL); waitpid(anchor, NULL, 0); return 126;
     }
     int status = 0, completed = 0;

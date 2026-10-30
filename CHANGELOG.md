@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-30 — macOS anchor group admission
+
+- The supervisor is the sole process-group setup writer; a private handoff and exact anchor identity check precede target fork. Owner EOF before admission starts no target and does not signal the inherited host group.
+- Added 4-way concurrent / 32-command startup evidence. Existing detachment and cleanup expectations remain unchanged; no retry or weakened containment fallback.
+
+
 ## 2026-10-30 — interactive worker completion records
 
 - Containment contract 4: optional paired host-private completion record and exact invocation ID, exclusive admission outside all target grants, owner-only directory/file and synchronized unverified/verified states.

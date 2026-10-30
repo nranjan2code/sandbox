@@ -66,3 +66,9 @@ On 2026-10-28, macOS 27.0 arm64 with Rust/Cargo 1.98.1:
 - No third-party package/version was added; existing locked `tempfile` is reused by the supervisor and CLI fixtures. No generated executable or private control state is committed.
 
 Linux containment, physical power-loss experiments and installed-client acceptance were not run or claimed. The repository commit and push do not update an installed helper or client.
+
+## Single-owner anchor group admission — 2026-10-30
+
+A real client app-suite run failed before its intended app-level assertion with target status 143 and `anchor group: Operation not permitted`. The macOS supervisor previously called `setpgid` in both parent and anchor, allowing anchor startup to race parent setup/teardown. The exact scheduling cause of that failure is not independently reproduced. The startup protocol now gives the parent sole group-creation ownership while the anchor waits on its private lifeline. A one-byte handoff and exact group-identity check precede target fork; EOF before admission starts no target and never tears down the inherited host group. The parent refuses every group/handoff failure without weakening containment or replaying commands.
+
+A 4-way concurrent fixture launches 32 individually verified commands, alongside existing detachment/fork/exec, owner-death, delayed-writer, deadline and private-worker receipt checks. Client outcome assertions remain unchanged; a synthetic startup pass is not production saturation evidence.

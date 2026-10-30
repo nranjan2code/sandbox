@@ -35,6 +35,28 @@ fn probe(work: &Path) -> String {
     output.to_str().unwrap().into()
 }
 #[test]
+fn concurrent_startup_keeps_group_admission_before_target_execution() {
+    let mut jobs = Vec::new();
+    for _ in 0..4 {
+        jobs.push(std::thread::spawn(|| {
+            let work = TempDir::new().unwrap();
+            for _ in 0..8 {
+                let output = run(work.path(), "/bin/echo", &["group-ready"]);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"group-ready\n");
+            }
+        }));
+    }
+    for job in jobs {
+        job.join().unwrap();
+    }
+}
+
+#[test]
 fn command_arguments_never_expand_read_permissions() {
     let temp = TempDir::new().unwrap();
     let work = temp.path().join("work");
