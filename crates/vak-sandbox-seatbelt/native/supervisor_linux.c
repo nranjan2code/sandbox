@@ -19,6 +19,8 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -40,6 +42,33 @@
 static volatile sig_atomic_t stopping = 0;
 
 static int add_path_rule(int ruleset, const char *path, uint64_t access);
+
+static int connect_worker_input(const char *path) {
+    if (path == NULL) return -1;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    size_t length = strlen(path);
+    if (length == 0 || length >= sizeof(address.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(address.sun_path, path, length + 1);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    char ready = 0;
+    if (read(fd, &ready, 1) != 1 || ready != 'R') {
+        close(fd);
+        errno = EPROTO;
+        return -1;
+    }
+    return fd;
+}
 
 static void stop_handler(int signal_number) {
     stopping = signal_number;
@@ -492,6 +521,7 @@ int main(int argc, char **argv) {
     char *cwd = NULL;
     char *receipt = NULL;
     char *lease_lock = NULL;
+    char *worker_input_socket = NULL;
     char *reads[MAX_RULES];
     char *writes[MAX_RULES];
     size_t read_count = 0;
@@ -508,6 +538,8 @@ int main(int argc, char **argv) {
             receipt = argv[index + 1];
         } else if (strcmp(argv[index], "--lease-lock") == 0) {
             lease_lock = argv[index + 1];
+        } else if (strcmp(argv[index], "--worker-input-socket") == 0) {
+            worker_input_socket = argv[index + 1];
         } else if (strcmp(argv[index], "--read") == 0 && read_count < MAX_RULES) {
             reads[read_count++] = argv[index + 1];
         } else if (strcmp(argv[index], "--write") == 0 && write_count < MAX_RULES) {
@@ -532,6 +564,10 @@ int main(int argc, char **argv) {
             }
             return fail("could not acquire Realm execution gate");
         }
+    }
+    int worker_input = connect_worker_input(worker_input_socket);
+    if (worker_input_socket != NULL && worker_input < 0) {
+        return fail("could not connect private worker input");
     }
 
     pid_t owner = getppid();
@@ -558,6 +594,11 @@ int main(int argc, char **argv) {
     }
     if (child == 0) {
         reset_child_signals();
+        if (worker_input >= 0) {
+            if ((worker_input != 3 && dup2(worker_input, 3) < 0) ||
+                fcntl(3, F_SETFD, 0) < 0) _exit(126);
+            if (worker_input != 3) (void)close(worker_input);
+        }
         int null_input = open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) {
             _exit(126);
@@ -577,6 +618,7 @@ int main(int argc, char **argv) {
                       strerror(errno));
         _exit(errno == ENOENT ? 127 : 126);
     }
+    if (worker_input >= 0) (void)close(worker_input);
     if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
         int saved_errno = errno;
         (void)kill(child, SIGKILL);

@@ -43,6 +43,44 @@ async fn execute(policy: Policy, cwd: &Path, command: &str, args: &[&str]) -> (i
     env.destroy().await.unwrap();
     (code, output)
 }
+
+#[tokio::test]
+async fn interactive_worker_fd_is_separate_and_target_stdin_stays_null() {
+    use tokio::io::AsyncWriteExt;
+
+    let work = tempfile::tempdir().unwrap();
+    let plan = ProcessPlan {
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "if read -r line <&0; then exit 77; fi; cat <&3".into(),
+        ],
+        cwd: Some(work.path().into()),
+        env: HashMap::new(),
+        policy: system_policy()
+            .allow_path_read(work.path().into())
+            .allow_path_write(work.path().into()),
+    };
+    let environment = SeatbeltBackend
+        .create_interactive_process(&plan)
+        .await
+        .unwrap();
+    let mut handle = environment
+        .exec_interactive("/bin/sh", &plan.args, &HashMap::new())
+        .await
+        .unwrap();
+    let mut input = handle.worker_io.take().expect("private worker I/O");
+    input.write_all(b"private-worker-input\n").await.unwrap();
+    drop(input);
+    let mut output = String::new();
+    while let Some(chunk) = handle.stdout.recv().await {
+        output.push_str(&chunk);
+    }
+    assert_eq!(handle.exit_code.await.unwrap(), 0);
+    assert_eq!(output, "private-worker-input\n");
+    environment.destroy().await.unwrap();
+}
+
 #[tokio::test]
 async fn explicit_deny_overrides_parent_grants_including_future_paths() {
     let work = tempfile::tempdir().unwrap();

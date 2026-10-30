@@ -24,7 +24,7 @@ thiserror = "2"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "sync", "time", "signal", "net"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

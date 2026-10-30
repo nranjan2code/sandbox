@@ -23,10 +23,165 @@ fn capability_report() -> serde_json::Value {
     serde_json::json!({
         "contract": 2,
         "execution_available": execution_available,
+        "interactive_worker_io": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
         "supervised_processes": execution_available,
         "detachment_denied": execution_available,
         "posix_spawn_denied": cfg!(target_os = "macos") && execution_available,
     })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Worker admission, private-channel lifetime, and cleanup are one security boundary."
+)]
+async fn run_interactive_worker(
+    cwd: PathBuf,
+    read_roots: Vec<PathBuf>,
+    write_roots: Vec<PathBuf>,
+    environment: Vec<String>,
+    command: String,
+    args: Vec<String>,
+) -> anyhow::Result<i32> {
+    use std::collections::HashMap;
+    use tokio::io::{AsyncWriteExt, copy, split};
+    use vak_sandbox_core::{Policy, ProcessPlan, SandboxBackend};
+
+    #[cfg(target_os = "macos")]
+    let backend = vak_sandbox_seatbelt::SeatbeltBackend;
+    #[cfg(target_os = "linux")]
+    let backend = vak_sandbox_seatbelt::LandlockBackend;
+    if !backend.available() {
+        anyhow::bail!("interactive OS containment is unavailable; no worker was started");
+    }
+
+    let cwd = std::fs::canonicalize(cwd)?;
+    let mut policy = Policy::deny_all();
+    let mut admitted_roots = Vec::new();
+    for root in read_roots {
+        let root = std::fs::canonicalize(root)?;
+        policy = policy.allow_path_read(root.clone());
+        admitted_roots.push(root);
+    }
+    for root in write_roots {
+        let root = std::fs::canonicalize(root)?;
+        if !root.is_dir() {
+            anyhow::bail!("worker write grants must be existing directories");
+        }
+        policy = policy
+            .allow_path_read(root.clone())
+            .allow_path_write(root.clone());
+        admitted_roots.push(root);
+    }
+    #[cfg(target_os = "macos")]
+    let system_roots = [
+        "/usr",
+        "/bin",
+        "/System",
+        "/Library",
+        "/opt",
+        "/private/etc",
+    ];
+    #[cfg(target_os = "linux")]
+    let system_roots = ["/usr", "/bin", "/lib", "/lib64", "/etc/ld.so.cache"];
+    for root in system_roots {
+        if std::path::Path::new(root).exists() {
+            let root = std::fs::canonicalize(root)?;
+            policy = policy.allow_path_read(root.clone());
+            admitted_roots.push(root);
+        }
+    }
+    let command = std::fs::canonicalize(&command)?;
+    if !command.is_file() {
+        anyhow::bail!("worker executable must be an existing regular file");
+    }
+    policy = policy.allow_path_read(command.clone());
+    admitted_roots.push(command.clone());
+    if !admitted_roots.iter().any(|root| cwd.starts_with(root)) {
+        anyhow::bail!("worker cwd is outside its explicit read/write grants");
+    }
+    for assignment in environment {
+        let Some((key, value)) = assignment.split_once('=') else {
+            anyhow::bail!("worker environment entries must be KEY=VALUE");
+        };
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || policy.env.set.contains_key(key)
+        {
+            anyhow::bail!("invalid or duplicate worker environment name");
+        }
+        policy.env.set.insert(key.to_owned(), value.to_owned());
+    }
+    let plan = ProcessPlan {
+        command: command.to_string_lossy().into_owned(),
+        args: args.clone(),
+        cwd: Some(cwd),
+        env: HashMap::new(),
+        policy,
+    };
+    let env = backend.create_interactive_process(&plan).await?;
+    let mut handle = env
+        .exec_interactive(&plan.command, &args, &HashMap::new())
+        .await?;
+    let worker_io = handle
+        .worker_io
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("interactive backend omitted private descriptor 3"))?;
+    let (mut worker_read, mut worker_write) = split(worker_io);
+    let input_task = tokio::spawn(async move {
+        let mut input = tokio::io::stdin();
+        let copied = copy(&mut input, &mut worker_write).await;
+        let shutdown = worker_write.shutdown().await;
+        copied.and(shutdown)
+    });
+    let output_task = tokio::spawn(async move {
+        let mut output = tokio::io::stdout();
+        copy(&mut worker_read, &mut output).await
+    });
+    let mut stdout = handle.stdout;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = tokio::io::stderr();
+        while let Some(chunk) = stdout.recv().await {
+            output.write_all(chunk.as_bytes()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let mut stderr = handle.stderr;
+    let stderr_task = tokio::spawn(async move {
+        let mut output = tokio::io::stderr();
+        while let Some(chunk) = stderr.recv().await {
+            output.write_all(chunk.as_bytes()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let mut exit = handle.exit_code;
+    let mut output_task = output_task;
+    let mut output_finished = false;
+    let exit_code = loop {
+        tokio::select! {
+            code = &mut exit => break code.unwrap_or(-1),
+            result = &mut output_task, if !output_finished => {
+                output_finished = true;
+                if !matches!(result, Ok(Ok(_))) {
+                    let _ = env.destroy().await;
+                    anyhow::bail!("private worker output forwarding failed");
+                }
+            }
+        }
+    };
+    input_task.abort();
+    let _ = input_task.await;
+    if !output_finished {
+        tokio::time::timeout(std::time::Duration::from_secs(5), output_task)
+            .await??
+            .map_err(anyhow::Error::from)?;
+    }
+    stdout_task.await??;
+    stderr_task.await??;
+    env.destroy().await?;
+    Ok(exit_code)
 }
 
 #[cfg(target_os = "linux")]
@@ -70,6 +225,27 @@ enum Commands {
         #[arg(help = "Command to run")]
         command: String,
         /// Command arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run a persistent worker with a private bidirectional descriptor 3
+    Worker {
+        /// Working directory, which must be inside an explicit read/write grant
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Additional existing read roots; repeat for each root
+        #[arg(long = "read", required = true)]
+        read_roots: Vec<PathBuf>,
+        /// Existing writable roots; repeat for each root
+        #[arg(long = "write")]
+        write_roots: Vec<PathBuf>,
+        /// Exact environment value as KEY=VALUE; repeat for each variable
+        #[arg(long = "env")]
+        environment: Vec<String>,
+        /// Explicit executable
+        #[arg(long)]
+        command: String,
+        /// Executable arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -183,10 +359,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let store = Arc::new(EnvStore::new(
-        cli.store.unwrap_or_else(EnvStore::default_root),
-    )?);
-    let mgr = Arc::new(SandboxManager::new(store));
+    let mgr = if matches!(&cli.command, Commands::Worker { .. }) {
+        None
+    } else {
+        let store = Arc::new(EnvStore::new(
+            cli.store.unwrap_or_else(EnvStore::default_root),
+        )?);
+        Some(Arc::new(SandboxManager::new(store)))
+    };
 
     match cli.command {
         Commands::Capabilities => println!("{}", capability_report()),
@@ -403,6 +583,35 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Worker {
+            cwd,
+            read_roots,
+            write_roots,
+            environment,
+            command,
+            args,
+        } => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let code = run_interactive_worker(
+                    cwd,
+                    read_roots,
+                    write_roots,
+                    environment,
+                    command,
+                    args,
+                )
+                .await?;
+                if code != 0 {
+                    std::process::exit(code.clamp(1, 255));
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (cwd, read_roots, write_roots, environment, command, args);
+                anyhow::bail!("interactive OS containment is unavailable on this platform");
+            }
+        }
         Commands::Env { action } => match action {
             EnvAction::List => {
                 println!(
@@ -419,6 +628,9 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Realm { action } => {
+            let mgr = mgr
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox manager was not initialized"))?;
             let realms = mgr.realms()?;
             let value = match action {
                 RealmAction::Create { project, env } => {
@@ -527,6 +739,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&value)?);
         }
         Commands::Status { realm_id } => {
+            let mgr = mgr
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox manager was not initialized"))?;
             if let Some(id) = realm_id {
                 if let Some(r) = mgr.get_realm(&id).await {
                     println!("Realm {}: {:?}", id, r.status);
@@ -539,6 +754,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Ping { realm_id } => {
+            let mgr = mgr
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox manager was not initialized"))?;
             mgr.ping(&realm_id).await;
             if mgr.heartbeat_monitor().is_alive(&realm_id) {
                 println!("✓ Pong from {realm_id}");
@@ -547,6 +765,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Health => {
+            let mgr = mgr
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox manager was not initialized"))?;
             let realms = mgr.list_realms().await;
             let alive = realms
                 .iter()

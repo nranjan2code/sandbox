@@ -12,7 +12,8 @@ pub mod path;
 pub mod policy;
 
 pub use backend::{
-    BackendCaps, ExecHandle, ProcessPlan, RealmPlan, SandboxBackend, SandboxEnv, SandboxMode,
+    AsyncReadWrite, BackendCaps, ExecHandle, ProcessPlan, RealmPlan, SandboxBackend, SandboxEnv,
+    SandboxMode,
 };
 pub use error::{Error, Result};
 pub use journal::{ChangeAction, JournalEntry, JournalOp, JournalStatus, PromotionJournal};

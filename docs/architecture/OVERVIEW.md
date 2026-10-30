@@ -16,7 +16,7 @@ The supervisor is small in-repo C compiled using macOS system headers; Rust reta
 
 ## Process lifetime
 
-Rust retains a private stdin lifetime pipe to S. S retains a separate lifetime pipe to A. Target code inherits neither control descriptor: its stdin is `/dev/null`, stdout/stderr are bounded host-reader pipes, and internal descriptors are close-on-exec or explicitly closed.
+Rust retains a private stdin lifetime pipe to S. S retains a separate lifetime pipe to A. Target code inherits neither control descriptor: stdin remains `/dev/null`, stdout/stderr are bounded host-reader pipes, and internal descriptors are close-on-exec or explicitly closed. An explicitly requested interactive worker gets one invocation-scoped full-duplex Unix socket on descriptor 3. Rust accepts the supervisor's connection, closes the listener, then sends a one-byte readiness signal; the supervisor will not launch the target before that handshake. The target receives the connected descriptor, never the supervisor lifetime pipe or listener. Ordinary one-shot commands receive no descriptor 3.
 
 A creates the target in A's process group and reserves that identity until cleanup. The profile rejects direct session/group changes, indirect syscall dispatch, and all `posix_spawn`, including its in-kernel session/group attributes. Fork/exec descendants therefore stay in the reserved group. Target signal permission is limited to its own sandbox and cannot terminate the trusted unsandboxed supervisors.
 

@@ -15,6 +15,8 @@
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #if SYS_syscall != 0 || SYS_setpgid != 82 || SYS_setsid != 147 || SYS_posix_spawn != 244
 #error Darwin syscall table changed; review the Seatbelt detachment gates
 #endif
@@ -26,6 +28,29 @@ static void die(const char *reason) { perror(reason); _exit(126); }
 static void group_exit(void) { kill(-getpgrp(), SIGKILL); _exit(126); }
 static void close_on_exec(int fd) {
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) die("control descriptor");
+}
+static int connect_worker_input(const char *path) {
+    if (path == NULL) return -1;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    size_t length = strlen(path);
+    if (length == 0 || length >= sizeof(address.sun_path)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(address.sun_path, path, length + 1);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1 ||
+        connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    char ready = 0;
+    if (read(fd, &ready, 1) != 1 || ready != 'R') {
+        close(fd);
+        errno = EPROTO;
+        return -1;
+    }
+    return fd;
 }
 
 /* Hold the anchor PID until the kernel reports every member dead. This avoids
@@ -65,6 +90,7 @@ static int complete(int receipt, int code) {
 
 int main(int argc, char **argv) {
     int receipt = -1;
+    char *worker_input_socket = NULL;
     while (argc > 3) {
         if (!strcmp(argv[1], "--lease-lock")) {
             int lease = open(argv[2], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -72,11 +98,15 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[1], "--receipt")) {
             receipt = open(argv[2], O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
             if (receipt < 0) die("completion receipt");
+        } else if (!strcmp(argv[1], "--worker-input-socket")) {
+            worker_input_socket = argv[2];
         } else { break; }
         argv += 2; argc -= 2;
     }
     if (receipt < 0) return 126;
     if (argc < 5) return 126; /* -p profile -- executable [args] */
+    int worker_input = connect_worker_input(worker_input_socket);
+    if (worker_input_socket != NULL && worker_input < 0) die("private worker input");
     struct pollfd owner = {.fd = STDIN_FILENO, .events = POLLIN | POLLHUP};
     if (poll(&owner, 1, 0) != 0) return complete(receipt, 143); /* never start work for a dead owner */
     int result[2], life[2];
@@ -96,12 +126,18 @@ int main(int argc, char **argv) {
         if (target < 0) group_exit();
         if (target == 0) {
             close(result[1]); close(life[0]);
+            if (worker_input >= 0) {
+                if ((worker_input != 3 && dup2(worker_input, 3) < 0) ||
+                    fcntl(3, F_SETFD, 0) < 0) die("target private I/O");
+                if (worker_input != 3) close(worker_input);
+            }
             int input = open("/dev/null", O_RDONLY);
             if (input < 0 || dup2(input, STDIN_FILENO) < 0) die("target input");
             if (input != STDIN_FILENO) close(input);
             execv("/usr/bin/sandbox-exec", argv);
             die("sandbox-exec");
         }
+        if (worker_input >= 0) close(worker_input);
         /* No output descriptors may keep a completed target's streams open. */
         close(STDIN_FILENO); close(STDOUT_FILENO); close(STDERR_FILENO);
         int reported = 0;
@@ -118,6 +154,7 @@ int main(int argc, char **argv) {
             if ((ready > 0 && fd.revents) || (ready < 0 && errno != EINTR)) group_exit();
         }
     }
+    if (worker_input >= 0) close(worker_input);
     close(result[1]); close(life[0]);
     /* Both processes establish the group before target code can execute. */
     if (setpgid(anchor, anchor) && errno != EACCES) {

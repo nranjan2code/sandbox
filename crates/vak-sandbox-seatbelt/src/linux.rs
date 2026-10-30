@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -173,9 +174,24 @@ impl LandlockBackend {
         lease: Option<&Path>,
         completion_path: Option<&Path>,
     ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
-        let plan = plan.clone();
-        let lease = lease.map(Path::to_path_buf);
-        let completion_path = completion_path.map(Path::to_path_buf);
+        Self::create_process_mode(
+            plan.clone(),
+            lease.map(Path::to_path_buf),
+            completion_path.map(Path::to_path_buf),
+            false,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the Linux fail-closed policy admission and supervised process setup together."
+    )]
+    fn create_process_mode(
+        plan: ProcessPlan,
+        lease: Option<PathBuf>,
+        completion_path: Option<PathBuf>,
+        interactive: bool,
+    ) -> vak_sandbox_core::backend::SandboxFuture<'static, Box<dyn SandboxEnv>> {
         Box::pin(async move {
             if !supported_kernel() {
                 return Err(Error::Backend(
@@ -261,6 +277,15 @@ impl LandlockBackend {
             if let Some(lease) = &lease {
                 command.arg("--lease-lock").arg(lease);
             }
+            let worker_listener = if interactive {
+                let socket = directory.path().join("worker-input.sock");
+                let listener = UnixListener::bind(&socket)?;
+                listener.set_nonblocking(true)?;
+                command.arg("--worker-input-socket").arg(&socket);
+                Some(listener)
+            } else {
+                None
+            };
             for path in &reads {
                 command.arg("--read").arg(path);
             }
@@ -283,6 +308,7 @@ impl LandlockBackend {
                 kill: Mutex::new(None),
                 done: Mutex::new(None),
                 completion_path: receipt,
+                worker_listener: Mutex::new(worker_listener),
                 _receipt: receipt_temp,
                 _helper: helper,
                 _control: directory,
@@ -321,6 +347,12 @@ impl SandboxBackend for LandlockBackend {
     ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
         self.create_process_with_lease(plan, None, None)
     }
+    fn create_interactive_process(
+        &self,
+        plan: &ProcessPlan,
+    ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
+        Self::create_process_mode(plan.clone(), None, None, true)
+    }
     fn create_realm(
         &self,
         _plan: &RealmPlan,
@@ -341,9 +373,113 @@ struct LandlockEnv {
     kill: Mutex<Option<oneshot::Sender<()>>>,
     done: Mutex<Option<oneshot::Receiver<Result<()>>>>,
     completion_path: PathBuf,
+    worker_listener: Mutex<Option<UnixListener>>,
     _receipt: Option<tempfile::TempPath>,
     _helper: tempfile::TempPath,
     _control: tempfile::TempDir,
+}
+
+impl LandlockEnv {
+    async fn start_exec(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        interactive: bool,
+    ) -> Result<ExecHandle> {
+        use tokio::io::AsyncWriteExt;
+
+        let matches =
+            command == self.process_spec.0 && args == self.process_spec.1 && env.is_empty();
+        let listener = self.worker_listener.lock().await.take();
+        if !matches || listener.is_some() != interactive {
+            self.destroy().await?;
+            return Err(Error::Backend(
+                "exec mode must match its approved Linux process plan".into(),
+            ));
+        }
+        let mut command = self
+            .command
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| Error::Backend("process was already started".into()))?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| Error::Backend(error.to_string()))?;
+        let worker_io: Option<Box<dyn vak_sandbox_core::AsyncReadWrite + Send + Unpin>> =
+            if let Some(listener) = listener {
+                let listener = tokio::net::UnixListener::from_std(listener)
+                    .map_err(|error| Error::Backend(error.to_string()))?;
+                match tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                {
+                    Ok(Ok((mut stream, _))) => {
+                        drop(listener);
+                        if let Err(error) = stream.write_all(b"R").await {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            return Err(Error::Backend(format!(
+                                "private worker input handshake failed: {error}"
+                            )));
+                        }
+                        Some(Box::new(stream))
+                    }
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(Error::Backend(format!(
+                            "private worker input connection failed: {error}"
+                        )));
+                    }
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(Error::Backend(
+                            "private worker input connection timed out".into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Backend("Missing stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Backend("Missing stderr".into()))?;
+        let (out_tx, stdout_rx) = mpsc::channel(8);
+        let (err_tx, stderr_rx) = mpsc::channel(8);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let (kill_tx, mut kill_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        *self.kill.lock().await = Some(kill_tx);
+        *self.done.lock().await = Some(done_rx);
+        tokio::spawn(forward(stdout, out_tx));
+        tokio::spawn(forward(stderr, err_tx));
+        let mut control = child.stdin.take();
+        let receipt = self.completion_path.clone();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                status = child.wait() => status,
+                _ = &mut kill_rx => { drop(control.take()); child.wait().await }
+            };
+            drop(control);
+            let result = completion(&receipt, status);
+            let code = result.as_ref().copied().unwrap_or(-1);
+            let _ = exit_tx.send(code);
+            let _ = done_tx.send(result.map(|_| ()));
+        });
+        Ok(ExecHandle {
+            worker_io,
+            stdout: stdout_rx,
+            stderr: stderr_rx,
+            exit_code: exit_rx,
+        })
+    }
 }
 
 impl SandboxEnv for LandlockEnv {
@@ -359,60 +495,21 @@ impl SandboxEnv for LandlockEnv {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>> {
-        let matches =
-            command == self.process_spec.0 && args == self.process_spec.1 && env.is_empty();
-        Box::pin(async move {
-            if !matches {
-                self.destroy().await?;
-                return Err(Error::Backend(
-                    "exec must match its approved Linux process plan".into(),
-                ));
-            }
-            let mut command = self
-                .command
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| Error::Backend("process was already started".into()))?;
-            let mut child = command
-                .spawn()
-                .map_err(|error| Error::Backend(error.to_string()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| Error::Backend("Missing stdout".into()))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| Error::Backend("Missing stderr".into()))?;
-            let (out_tx, stdout_rx) = mpsc::channel(8);
-            let (err_tx, stderr_rx) = mpsc::channel(8);
-            let (exit_tx, exit_rx) = oneshot::channel();
-            let (kill_tx, mut kill_rx) = oneshot::channel();
-            let (done_tx, done_rx) = oneshot::channel();
-            *self.kill.lock().await = Some(kill_tx);
-            *self.done.lock().await = Some(done_rx);
-            tokio::spawn(forward(stdout, out_tx));
-            tokio::spawn(forward(stderr, err_tx));
-            let mut control = child.stdin.take();
-            let receipt = self.completion_path.clone();
-            tokio::spawn(async move {
-                let status = tokio::select! {
-                    status = child.wait() => status,
-                    _ = &mut kill_rx => { drop(control.take()); child.wait().await }
-                };
-                drop(control);
-                let result = completion(&receipt, status);
-                let code = result.as_ref().copied().unwrap_or(-1);
-                let _ = exit_tx.send(code);
-                let _ = done_tx.send(result.map(|_| ()));
-            });
-            Ok(ExecHandle {
-                stdout: stdout_rx,
-                stderr: stderr_rx,
-                exit_code: exit_rx,
-            })
-        })
+        let command = command.to_owned();
+        let args = args.to_vec();
+        let env = env.clone();
+        Box::pin(async move { self.start_exec(&command, &args, &env, false).await })
+    }
+    fn exec_interactive(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>> {
+        let command = command.to_owned();
+        let args = args.to_vec();
+        let env = env.clone();
+        Box::pin(async move { self.start_exec(&command, &args, &env, true).await })
     }
     fn destroy(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
@@ -700,6 +797,46 @@ mod tests {
         assert_eq!(handle.exit_code.await.unwrap(), 143);
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn interactive_worker_fd_is_separate_and_target_stdin_stays_null() {
+        use tokio::io::AsyncWriteExt;
+
+        let backend = LandlockBackend;
+        if !backend.available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let plan = ProcessPlan {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "if read -r line <&0; then exit 77; fi; cat <&3".into(),
+            ],
+            cwd: Some(workspace.path().into()),
+            env: HashMap::new(),
+            policy: policy(workspace.path()),
+        };
+        let environment = backend.create_interactive_process(&plan).await.unwrap();
+        let mut handle = environment
+            .exec_interactive("/bin/sh", &plan.args, &HashMap::new())
+            .await
+            .unwrap();
+        let mut input = handle.worker_io.take().expect("private worker I/O");
+        input.write_all(b"private-worker-input\n").await.unwrap();
+        drop(input);
+        let output_task = tokio::spawn(async move {
+            let mut output = String::new();
+            while let Some(chunk) = handle.stdout.recv().await {
+                output.push_str(&chunk);
+            }
+            output
+        });
+        let code = handle.exit_code.await.unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(output_task.await.unwrap(), "private-worker-input\n");
+        environment.destroy().await.unwrap();
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ mod macos {
     use std::future::Future;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::path::Path;
     use std::pin::Pin;
     use std::process::Stdio;
@@ -186,6 +187,12 @@ mod macos {
         ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
             self.create_process_with_lease(plan, None, None)
         }
+        fn create_interactive_process(
+            &self,
+            plan: &ProcessPlan,
+        ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
+            Self::create_process_mode(plan.clone(), None, None, true)
+        }
 
         fn create_realm(
             &self,
@@ -209,9 +216,24 @@ mod macos {
             lease: Option<&Path>,
             completion: Option<&Path>,
         ) -> vak_sandbox_core::backend::SandboxFuture<'_, Box<dyn SandboxEnv>> {
-            let lease = lease.map(Path::to_path_buf);
-            let completion = completion.map(Path::to_path_buf);
-            let plan = plan.clone();
+            Self::create_process_mode(
+                plan.clone(),
+                lease.map(Path::to_path_buf),
+                completion.map(Path::to_path_buf),
+                false,
+            )
+        }
+
+        #[allow(
+            clippy::too_many_lines,
+            reason = "Keep the macOS fail-closed policy admission and supervised process setup together."
+        )]
+        fn create_process_mode(
+            plan: ProcessPlan,
+            lease: Option<std::path::PathBuf>,
+            completion: Option<std::path::PathBuf>,
+            interactive: bool,
+        ) -> vak_sandbox_core::backend::SandboxFuture<'static, Box<dyn SandboxEnv>> {
             Box::pin(async move {
                 validate_resource_policy(&plan.policy.resources)?;
                 let profile = profile(&plan.policy)?;
@@ -244,6 +266,14 @@ mod macos {
                 let control = tempfile::Builder::new()
                     .prefix("vaksb-supervisor-")
                     .tempdir_in("/private/tmp")?;
+                let worker_listener = if interactive {
+                    let socket = control.path().join("worker-input.sock");
+                    let listener = UnixListener::bind(&socket)?;
+                    listener.set_nonblocking(true)?;
+                    Some((socket, listener))
+                } else {
+                    None
+                };
                 let mut supervisor = tempfile::NamedTempFile::new_in(control.path())?;
                 let completion_path = if let Some(path) = completion {
                     path
@@ -280,6 +310,9 @@ mod macos {
                     cmd.arg("--lease-lock").arg(lease);
                 }
                 cmd.arg("--receipt").arg(&completion_path);
+                if let Some((socket, _)) = &worker_listener {
+                    cmd.arg("--worker-input-socket").arg(socket);
+                }
                 cmd.arg("-p")
                     .arg(profile)
                     .arg("--")
@@ -305,6 +338,7 @@ mod macos {
                     done: Mutex::new(None),
                     process_spec: (plan.command, plan.args),
                     completion_path,
+                    worker_listener: Mutex::new(worker_listener.map(|(_, listener)| listener)),
                     _supervisor: supervisor,
                     _control: control,
                 }) as Box<dyn SandboxEnv>)
@@ -319,6 +353,7 @@ mod macos {
         done: Mutex<Option<oneshot::Receiver<Result<()>>>>,
         process_spec: (String, Vec<String>),
         completion_path: std::path::PathBuf,
+        worker_listener: Mutex<Option<UnixListener>>,
         _supervisor: tempfile::TempPath,
         _control: tempfile::TempDir,
     }
@@ -355,6 +390,108 @@ mod macos {
             }
         }
     }
+    impl SeatbeltEnv {
+        async fn start_exec(
+            &self,
+            command: &str,
+            args: &[String],
+            env: &HashMap<String, String>,
+            interactive: bool,
+        ) -> Result<ExecHandle> {
+            use tokio::io::AsyncWriteExt;
+
+            let matches =
+                command == self.process_spec.0 && args == self.process_spec.1 && env.is_empty();
+            let listener = self.worker_listener.lock().await.take();
+            if !matches || listener.is_some() != interactive {
+                self.destroy().await?;
+                return Err(Error::Backend(
+                    "exec mode must match its approved macOS process plan".into(),
+                ));
+            }
+            let mut child = self
+                .child
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| Error::Backend("process was already started".into()))?;
+            let worker_io: Option<Box<dyn vak_sandbox_core::AsyncReadWrite + Send + Unpin>> =
+                if let Some(listener) = listener {
+                    let listener = tokio::net::UnixListener::from_std(listener)
+                        .map_err(|error| Error::Backend(error.to_string()))?;
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                    {
+                        Ok(Ok((mut stream, _))) => {
+                            drop(listener);
+                            if let Err(error) = stream.write_all(b"R").await {
+                                let _ = child.kill().await;
+                                let status = child.wait().await;
+                                let _ = completion(&self.completion_path, status);
+                                return Err(Error::Backend(format!(
+                                    "private worker input handshake failed: {error}"
+                                )));
+                            }
+                            Some(Box::new(stream))
+                        }
+                        Ok(Err(error)) => {
+                            let _ = child.kill().await;
+                            let status = child.wait().await;
+                            let _ = completion(&self.completion_path, status);
+                            return Err(Error::Backend(format!(
+                                "private worker input connection failed: {error}"
+                            )));
+                        }
+                        Err(_) => {
+                            let _ = child.kill().await;
+                            let status = child.wait().await;
+                            let _ = completion(&self.completion_path, status);
+                            return Err(Error::Backend(
+                                "private worker input connection timed out".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::Backend("Missing stdout".into()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| Error::Backend("Missing stderr".into()))?;
+            let (out_tx, stdout_rx) = mpsc::channel(8);
+            let (err_tx, stderr_rx) = mpsc::channel(8);
+            let (exit_tx, exit_rx) = oneshot::channel();
+            let (kill_tx, mut kill_rx) = oneshot::channel();
+            let (done_tx, done_rx) = oneshot::channel();
+            *self.kill.lock().await = Some(kill_tx);
+            *self.done.lock().await = Some(done_rx);
+            tokio::spawn(forward(stdout, out_tx));
+            tokio::spawn(forward(stderr, err_tx));
+            let mut lifetime = child.stdin.take();
+            let completion_path = self.completion_path.clone();
+            tokio::spawn(async move {
+                let status = tokio::select! {
+                    status = child.wait() => status,
+                    _ = &mut kill_rx => { drop(lifetime.take()); child.wait().await }
+                };
+                drop(lifetime);
+                let result = completion(&completion_path, status);
+                let code = result.as_ref().copied().unwrap_or(-1);
+                let _ = exit_tx.send(code);
+                let _ = done_tx.send(result.map(|_| ()));
+            });
+            Ok(ExecHandle {
+                worker_io,
+                stdout: stdout_rx,
+                stderr: stderr_rx,
+                exit_code: exit_rx,
+            })
+        }
+    }
     impl SandboxEnv for SeatbeltEnv {
         fn id(&self) -> &str {
             &self.id
@@ -368,57 +505,21 @@ mod macos {
             args: &[String],
             env: &HashMap<String, String>,
         ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>> {
-            let matches =
-                command == self.process_spec.0 && args == self.process_spec.1 && env.is_empty();
-            Box::pin(async move {
-                if !matches {
-                    self.destroy().await?;
-                    return Err(Error::Backend(
-                        "exec must match its approved process plan, including environment".into(),
-                    ));
-                }
-                let mut child = self
-                    .child
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or_else(|| Error::Backend("process was already started".into()))?;
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| Error::Backend("Missing stdout".into()))?;
-                let stderr = child
-                    .stderr
-                    .take()
-                    .ok_or_else(|| Error::Backend("Missing stderr".into()))?;
-                let (out_tx, stdout_rx) = mpsc::channel(8);
-                let (err_tx, stderr_rx) = mpsc::channel(8);
-                let (exit_tx, exit_rx) = oneshot::channel();
-                let (kill_tx, mut kill_rx) = oneshot::channel();
-                let (done_tx, done_rx) = oneshot::channel();
-                *self.kill.lock().await = Some(kill_tx);
-                *self.done.lock().await = Some(done_rx);
-                tokio::spawn(forward(stdout, out_tx));
-                tokio::spawn(forward(stderr, err_tx));
-                let mut lifetime = child.stdin.take();
-                let completion_path = self.completion_path.clone();
-                tokio::spawn(async move {
-                    let status = tokio::select! {
-                        status = child.wait() => status,
-                        _ = &mut kill_rx => { drop(lifetime.take()); child.wait().await }
-                    };
-                    drop(lifetime);
-                    let result = completion(&completion_path, status);
-                    let code = result.as_ref().copied().unwrap_or(-1);
-                    let _ = exit_tx.send(code);
-                    let _ = done_tx.send(result.map(|_| ()));
-                });
-                Ok(ExecHandle {
-                    stdout: stdout_rx,
-                    stderr: stderr_rx,
-                    exit_code: exit_rx,
-                })
-            })
+            let command = command.to_owned();
+            let args = args.to_vec();
+            let env = env.clone();
+            Box::pin(async move { self.start_exec(&command, &args, &env, false).await })
+        }
+        fn exec_interactive(
+            &self,
+            command: &str,
+            args: &[String],
+            env: &HashMap<String, String>,
+        ) -> Pin<Box<dyn Future<Output = Result<ExecHandle>> + Send + '_>> {
+            let command = command.to_owned();
+            let args = args.to_vec();
+            let env = env.clone();
+            Box::pin(async move { self.start_exec(&command, &args, &env, true).await })
         }
         fn destroy(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
             Box::pin(async move {

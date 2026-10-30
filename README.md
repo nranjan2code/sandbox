@@ -23,6 +23,15 @@ Runtime-independent process containment and durable project copies with reviewed
 
 `fork` followed by `exec` is supported on both backends. macOS blocks `setsid`, `setpgid`, indirect syscall dispatch and `posix_spawn`. Linux drops the target's inherited capabilities and blocks session/group changes, mount and namespace operations, network syscalls, and attempts to signal processes outside the contained process group or its trusted supervisor. Some process libraries and build tools remain incompatible. Do not disable the gates or run failed work on the host as an automatic fallback. See [backend compatibility](docs/backends/BACKENDS.md).
 
+Ordinary target stdin stays `/dev/null`. The explicit `create_interactive_process` API gives a persistent, invocation-scoped worker a full-duplex private descriptor 3; it does not reuse the supervisor's lifetime pipe. This channel does not grant filesystem or network access and must be paired with a narrowly scoped process policy.
+
+The `vaksb worker` CLI exposes that boundary for a host that supervises a persistent sidecar. It requires an existing working directory inside an explicit read/write grant, an explicit executable, and repeated `--env KEY=VALUE` entries. Worker protocol bytes travel on descriptor 3 (the wrapper's stdin/stdout); target stdout and stderr are forwarded to wrapper stderr for diagnostics. Worker startup skips the durable Realm store. This command is a containment primitive: the host still owns task admission, user approval, workspace scoping, lifecycle policy, and receipts.
+
+```sh
+vaksb worker --cwd ./workspace --read ./workspace --write ./workspace \
+  --env PATH=/usr/bin:/bin --command /path/to/sidecar -- --stdio-protocol
+```
+
 ## Build and verify
 
 The current verification stack is Rust 1.99.1. Native execution builds the small in-repo supervisor using the system C compiler. macOS requires command-line developer tools and `/usr/bin/sandbox-exec`; Linux requires x86_64 or aarch64, a C compiler, Landlock ABI 5+, and seccomp filtering. The embedded supervisor uses no separately installed daemon or network listener.
