@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-31 — worker loopback broker ports
+
+- `worker --allow-localhost-port <port>` (repeatable) lets a target connect only to a host-run broker on those loopback ports, using the existing Seatbelt localhost endpoint filter. Remote IPs and DNS stay denied; the broker decides destinations. Linux rejects the flag before effects. Capability report adds `localhost_broker_ports`.
+
 ## 2026-10-30 — macOS anchor group admission
 
 - The supervisor is the sole process-group setup writer; a private handoff and exact anchor identity check precede target fork. Owner EOF before admission starts no target and does not signal the inherited host group.

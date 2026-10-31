@@ -29,6 +29,7 @@ fn capability_report() -> serde_json::Value {
         "interactive_worker_io": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
         "worker_completion_records": execution_available && cfg!(any(target_os = "macos", target_os = "linux")),
         "filesystem_exclusions": execution_available && cfg!(target_os = "macos"),
+        "localhost_broker_ports": execution_available && cfg!(target_os = "macos"),
         "supervised_processes": execution_available,
         "detachment_denied": execution_available,
         "posix_spawn_denied": cfg!(target_os = "macos") && execution_available,
@@ -50,6 +51,7 @@ async fn run_interactive_worker(
     command: String,
     args: Vec<String>,
     completion: Option<worker_completion::CompletionRequest>,
+    localhost_ports: Vec<u16>,
 ) -> anyhow::Result<i32> {
     use std::collections::HashMap;
     use tokio::io::{AsyncWriteExt, copy, split};
@@ -65,6 +67,15 @@ async fn run_interactive_worker(
 
     let cwd = std::fs::canonicalize(cwd)?;
     let mut policy = Policy::deny_all();
+    // A host-run broker on these loopback ports is the only network a worker may reach;
+    // the backend rejects port 0 and platforms that cannot filter loopback ports.
+    if !localhost_ports.is_empty() {
+        policy.network.allow = true;
+        policy.network.allow_outbound = true;
+        policy.network.allow_localhost = true;
+        policy.network.allow_hosts = vec!["127.0.0.1".into()];
+        policy.network.allow_ports = localhost_ports;
+    }
     let mut admitted_roots = Vec::new();
     for root in read_roots {
         let root = std::fs::canonicalize(root)?;
@@ -302,6 +313,9 @@ enum Commands {
         /// Exact host invocation identity bound to the completion record
         #[arg(long, requires = "completion_record")]
         invocation_id: Option<String>,
+        /// Loopback TCP port of a host-run network broker the target may connect to; repeat for each
+        #[arg(long = "allow-localhost-port")]
+        localhost_ports: Vec<u16>,
         /// Explicit executable
         #[arg(long)]
         command: String,
@@ -651,6 +665,7 @@ async fn main() -> anyhow::Result<()> {
             environment,
             completion_record,
             invocation_id,
+            localhost_ports,
             command,
             args,
         } => {
@@ -672,6 +687,7 @@ async fn main() -> anyhow::Result<()> {
                                 invocation_id,
                             },
                         ),
+                    localhost_ports,
                 )
                 .await?;
                 if code != 0 {
@@ -690,6 +706,7 @@ async fn main() -> anyhow::Result<()> {
                     args,
                     completion_record,
                     invocation_id,
+                    localhost_ports,
                 );
                 anyhow::bail!("interactive OS containment is unavailable on this platform");
             }
@@ -884,6 +901,10 @@ mod cli_tests {
         assert_eq!(report["detachment_denied"], available);
         assert_eq!(
             report["filesystem_exclusions"],
+            cfg!(target_os = "macos") && available
+        );
+        assert_eq!(
+            report["localhost_broker_ports"],
             cfg!(target_os = "macos") && available
         );
         assert_eq!(
